@@ -114,9 +114,10 @@ from PIL import Image, ImageDraw
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-SERVICE_NAME  = "gestureControl"
-CONFIG_PORT   = 7070
-POLL_INTERVAL = 3   # seconds
+SERVICE_NAME        = "gestureControl"
+CONFIG_PORT         = 7070
+ENGINE_STREAM_PORT  = 7071
+POLL_INTERVAL       = 3   # seconds
 
 SCRIPTS_DIR   = Path(__file__).parent
 CONFIG_SCRIPT = SCRIPTS_DIR / "gestureControl-config.py"
@@ -186,11 +187,28 @@ _configProc = None
 
 def openConfigUI():
     global _configProc
-    if _configProc is None or _configProc.poll() is not None:
-        _configProc = subprocess.Popen(
-            [str(VENV_PYTHON), str(CONFIG_SCRIPT), "--window"],
-            start_new_session=True,
-        )
+    if _configProc is not None and _configProc.poll() is None:
+        return  # already open
+
+    # Ensure the engine is running before opening the UI
+    if not serviceActive():
+        serviceCtl("start")
+
+    # Wait for the engine's stream server to be ready (up to 10 s)
+    import urllib.request
+    for _ in range(40):
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{ENGINE_STREAM_PORT}/state", timeout=0.5
+            ).close()
+            break
+        except Exception:
+            time.sleep(0.25)
+
+    _configProc = subprocess.Popen(
+        [str(VENV_PYTHON), str(CONFIG_SCRIPT), "--window"],
+        start_new_session=True,
+    )
 
 
 # ── Tray app ───────────────────────────────────────────────────────────────────

@@ -8,6 +8,8 @@ Built on [MediaPipe](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_
 
 ## Install
 
+Use the AUR helper of your choice:
+
 ```bash
 paru -S gesturecontrol
 ```
@@ -45,10 +47,10 @@ The config UI (accessible from the tray) lets you define everything visually wit
 
 Config files live at `~/.config/gesturecontrol/`:
 
-| File | Purpose |
-|---|---|
+| File            | Purpose                          |
+| --------------- | -------------------------------- |
 | `triggers.toml` | Poses, bindings, camera settings |
-| `actions.toml` | What to do when a signal fires |
+| `actions.toml`  | What to do when a signal fires   |
 
 Changes are picked up live — no restart needed.
 
@@ -82,12 +84,12 @@ action = { type = "exec", cmd = ["playerctl", "play-pause"] }
 
 Four components, all optional beyond the engine:
 
-| Component | Role |
-|---|---|
-| `gestureControl.py` | Engine — reads webcam, runs MediaPipe, emits D-Bus signals |
+| Component                   | Role                                                          |
+| --------------------------- | ------------------------------------------------------------- |
+| `gestureControl.py`         | Engine — reads webcam, runs MediaPipe, emits D-Bus signals    |
 | `gestureControl-actions.py` | Action daemon — listens on D-Bus, executes configured actions |
-| `gestureControl-config.py` | Config UI — Flask server + live camera preview |
-| `gestureControl-tray.py` | Tray icon — service controls + config UI launcher |
+| `gestureControl-config.py`  | Config UI — Flask server + live camera preview                |
+| `gestureControl-tray.py`    | Tray icon — service controls + config UI launcher             |
 
 D-Bus interface: `org.gesturecontrol.Engine` at `/org/gesturecontrol`
 
@@ -100,12 +102,15 @@ Any program can subscribe to these signals independently of the bundled action d
 ## Dependencies
 
 **Required** (installed automatically via pacman):
+
 - `python >= 3.11`, `python-dbus`, `python-gobject`, `gtk3`, `webkit2gtk`, `curl`
 
 **Pip** (installed automatically on first run):
+
 - `mediapipe >= 0.10.30`, `opencv-python >= 4.9`, `flask >= 3.0`, `pillow >= 10.0`
 
 **Optional**:
+
 - `xdotool` — key action support
 - `libnotify` — sequence progress notifications
 - `playerctl` — media control actions
@@ -139,6 +144,7 @@ Pull requests are welcome. For significant changes, open an issue first to discu
 The four main scripts are self-contained and well-commented — most contributions will touch one of them plus the config UI in `gestureControl-config-ui/`. The D-Bus interface (`DBUS_IFACE` in the engine and action daemon) is the stable contract between components; changes there should be discussed before breaking it.
 
 When submitting a PR:
+
 - Keep changes focused — one feature or fix per request
 - Test with a real webcam before submitting
 - If you're adding a new trigger type or action type, include an example in `config/`

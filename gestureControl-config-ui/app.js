@@ -32,6 +32,7 @@ async function loadConfig() {
   state.triggers = data.triggers || [];
   state.actions  = data.actions  || [];
   renderAll();
+  loadCameras();
 }
 
 function renderAll() {
@@ -43,7 +44,80 @@ function renderAll() {
 document.addEventListener("DOMContentLoaded", () => {
   loadConfig();
   startSSE();
+  startFramePolling();
 });
+
+
+// ── Camera frame polling ───────────────────────────────────────────────────────
+
+function startFramePolling() {
+  const img = document.getElementById("camera-feed");
+  let prevUrl = null;
+
+  async function poll() {
+    try {
+      const res = await fetch("/api/frame");
+      if (res.ok) {
+        const blob = await res.blob();
+        const url  = URL.createObjectURL(blob);
+        img.src = url;
+        if (prevUrl) URL.revokeObjectURL(prevUrl);
+        prevUrl = url;
+      }
+    } catch {}
+    setTimeout(poll, 50); // ~20 fps
+  }
+
+  poll();
+}
+
+
+// ── Camera selector ───────────────────────────────────────────────────────────
+
+async function loadCameras() {
+  const sel = document.getElementById("camera-select");
+  try {
+    const res     = await fetch("/api/cameras");
+    const cameras = await res.json();
+
+    const current = state.settings.camera ?? null;
+    sel.innerHTML = cameras.length === 0
+      ? `<option value="">No cameras found</option>`
+      : cameras.map(c =>
+          `<option value="${c.index}" ${c.index === current ? "selected" : ""}>${c.name} (${c.path})</option>`
+        ).join("");
+  } catch {
+    sel.innerHTML = `<option value="">Could not load cameras</option>`;
+  }
+}
+
+async function onCameraChange(value) {
+  const index = parseInt(value, 10);
+  if (isNaN(index)) return;
+
+  const sel = document.getElementById("camera-select");
+  sel.disabled = true;
+  const prev = sel.title;
+  try {
+    const res  = await fetch("/api/set-camera", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ camera: index }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      state.settings.camera = index;
+      if (data.restarted) {
+        sel.title = "Engine restarting…";
+        setTimeout(() => { sel.title = prev; }, 3000);
+      }
+    } else {
+      alert("Failed to switch camera:\n" + data.error);
+    }
+  } finally {
+    sel.disabled = false;
+  }
+}
 
 
 // ── SSE: live hand state ───────────────────────────────────────────────────────
@@ -72,20 +146,33 @@ function startSSE() {
     // Update the capture row inside an open pose modal
     updateCaptureRow();
 
-    // Enable capture button when a pose editor is open and a hand is visible
-    const captureBtn = document.getElementById("capture-btn");
-    if (captureTarget && (liveFingers.right || liveFingers.left)) {
-      captureBtn.disabled = false;
-    }
+    const hasHand = !!(liveFingers.right || liveFingers.left);
+    document.getElementById("capture-btn").disabled = !hasHand;
+    document.getElementById("capture-hint").classList.toggle("hidden", hasHand);
   };
   es.onerror = () => {
     // reconnects automatically
   };
 
   document.getElementById("capture-btn").addEventListener("click", () => {
-    if (!captureTarget) return;
     const fingers = liveFingers.right || liveFingers.left;
-    if (fingers) captureTarget(fingers);
+    if (!fingers) return;
+
+    // If a pose editor modal is open, fill it in directly
+    if (captureTarget) {
+      captureTarget(fingers);
+      return;
+    }
+
+    // Otherwise find a matching pose or create a new one
+    const matchIndex = state.poses.findIndex(p => poseMatchesFingers(p, fingers));
+    if (matchIndex !== -1) {
+      switchTab("poses");
+      editPose(matchIndex);
+    } else {
+      switchTab("poses");
+      captureNewPose(fingers);
+    }
   });
 }
 
@@ -272,26 +359,14 @@ function esc(str) {
 function openModal(html, ctx, onCapture) {
   document.getElementById("modal-body").innerHTML = html;
   document.getElementById("modal-backdrop").classList.remove("hidden");
-  modalCtx = ctx;
-
-  if (onCapture) {
-    captureTarget = onCapture;
-    document.getElementById("capture-btn").disabled =
-      !(liveFingers.right || liveFingers.left);
-    document.getElementById("capture-hint").classList.add("hidden");
-  } else {
-    captureTarget = null;
-    document.getElementById("capture-btn").disabled = true;
-    document.getElementById("capture-hint").classList.remove("hidden");
-  }
+  modalCtx      = ctx;
+  captureTarget = onCapture || null;
 }
 
 function closeModal() {
   document.getElementById("modal-backdrop").classList.add("hidden");
   modalCtx      = null;
   captureTarget = null;
-  document.getElementById("capture-btn").disabled = true;
-  document.getElementById("capture-hint").classList.remove("hidden");
 }
 
 function maybeCloseModal(evt) {
@@ -321,6 +396,19 @@ function updateCaptureRow() {
 // ── Pose editing ──────────────────────────────────────────────────────────────
 
 const FINGER_NAMES  = ["thumb","index","middle","ring","pinky"];
+
+function poseMatchesFingers(pose, fingers) {
+  return FINGER_NAMES.every((f, i) => {
+    const v = pose[f];
+    return v === undefined || v === null || v === fingers[i];
+  });
+}
+
+function captureNewPose(fingers) {
+  const pose = { name: "" };
+  FINGER_NAMES.forEach((f, i) => { pose[f] = fingers[i]; });
+  openModal(poseModalHtml(pose), { type: "pose", index: -1 }, applyCaptureToPoseEditor);
+}
 const FINGER_LABELS = ["Thumb","Index","Middle","Ring","Pinky"];
 const FINGER_ICONS  = { true: "●", false: "○", null: "–" };
 

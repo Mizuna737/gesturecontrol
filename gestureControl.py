@@ -1104,9 +1104,25 @@ class StreamServer:
                     self._serveStream()
                 elif self.path == "/state":
                     self._serveState()
+                elif self.path == "/snapshot":
+                    self._serveSnapshot()
                 else:
                     self.send_response(404)
                     self.end_headers()
+
+            def _serveSnapshot(self):
+                with server._lock:
+                    frame = server._frame
+                if frame is None:
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(frame)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(frame)
 
             def _serveStream(self):
                 self.send_response(200)

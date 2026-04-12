@@ -2,6 +2,7 @@
 Description=Gesture control engine — webcam to D-Bus signals
 After=graphical-session.target
 PartOf=graphical-session.target
+Wants=gestureControl-actions.service
 
 [Service]
 Type=simple

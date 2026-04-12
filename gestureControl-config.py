@@ -114,6 +114,12 @@ class CameraState:
         self._hands = {}     # {side: {"fingers": [T,I,M,R,P], "pose": str|None}}
         self._error = None   # string if camera failed to open
 
+    def reset(self):
+        with self._lock:
+            self._frame = None
+            self._hands = {}
+            self._error = None
+
     def setFrame(self, jpegBytes):
         with self._lock:
             self._frame = jpegBytes
@@ -365,6 +371,22 @@ cameraState     = CameraState()
 configDir       = DEFAULT_CONFIG
 useEngineStream = False   # set in main() after checking engine availability
 
+_cameraStopEvent = None  # threading.Event for the current camera thread
+
+
+def _restartCameraThread(camInput):
+    """Stop the existing camera thread (if any) and start a new one."""
+    global _cameraStopEvent
+    if _cameraStopEvent is not None:
+        _cameraStopEvent.set()
+    cameraState.reset()
+    _cameraStopEvent = threading.Event()
+    threading.Thread(
+        target=cameraThread,
+        args=(camInput, configDir, cameraState, _cameraStopEvent),
+        daemon=True,
+    ).start()
+
 
 @app.route("/")
 def index():
@@ -442,6 +464,26 @@ def sseState():
     )
 
 
+@app.route("/api/frame")
+def getFrame():
+    if useEngineStream:
+        import urllib.request
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{ENGINE_STREAM_PORT}/snapshot", timeout=1
+            ) as resp:
+                return Response(resp.read(), mimetype="image/jpeg",
+                                headers={"Cache-Control": "no-store"})
+        except Exception:
+            return "", 503
+    else:
+        frame = cameraState.getFrame()
+        if frame is None:
+            return "", 503
+        return Response(frame, mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
+
 @app.route("/api/config")
 def getConfig():
     triggersPath = Path(configDir) / "triggers.toml"
@@ -492,6 +534,69 @@ def saveActions():
         return jsonify({"ok": False, "error": str(e)}), 400
 
 
+@app.route("/api/cameras")
+def listCameras():
+    """Return available V4L2 video devices with friendly names where possible."""
+    import subprocess, re, glob as _glob
+    cameras = []
+    nameMap = {}
+    try:
+        out = subprocess.check_output(
+            ["v4l2-ctl", "--list-devices"], text=True, stderr=subprocess.DEVNULL
+        )
+        currentName = None
+        for line in out.splitlines():
+            m = re.match(r"^(.+?)\s*\(", line)
+            if m:
+                currentName = m.group(1).strip()
+            else:
+                stripped = line.strip()
+                m2 = re.match(r"^/dev/video(\d+)$", stripped)
+                if m2 and currentName:
+                    nameMap[int(m2.group(1))] = currentName
+    except Exception:
+        pass
+
+    for path in sorted(_glob.glob("/dev/video*")):
+        m = re.match(r"/dev/video(\d+)$", path)
+        if not m:
+            continue
+        idx  = int(m.group(1))
+        name = nameMap.get(idx, path)
+        cameras.append({"index": idx, "name": name, "path": path})
+
+    return jsonify(cameras)
+
+
+@app.route("/api/set-camera", methods=["POST"])
+def setCamera():
+    """Persist camera index to triggers.toml and, when not proxying the engine,
+    restart the local camera thread immediately."""
+    data = request.get_json()
+    camIndex = data.get("camera")
+    if camIndex is None:
+        return jsonify({"ok": False, "error": "camera field required"}), 400
+
+    trigPath = Path(configDir) / "triggers.toml"
+    try:
+        cfg = {}
+        if trigPath.exists():
+            with open(trigPath, "rb") as f:
+                cfg = tomllib.load(f)
+        cfg.setdefault("settings", {})["camera"] = camIndex
+        trigPath.write_text(serializeTriggersTOML(cfg))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+    if useEngineStream:
+        import subprocess
+        subprocess.Popen(["systemctl", "--user", "restart", "gestureControl.service"])
+        return jsonify({"ok": True, "restarted": True})
+    else:
+        _restartCameraThread(camIndex)
+        return jsonify({"ok": True, "restarted": False})
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def engineStreamAvailable():
@@ -539,12 +644,7 @@ def main():
                     camInput = tomllib.load(f).get("settings", {}).get("camera", 0)
             else:
                 camInput = 0
-        stopEvent = threading.Event()
-        threading.Thread(
-            target=cameraThread,
-            args=(camInput, configDir, cameraState, stopEvent),
-            daemon=True,
-        ).start()
+        _restartCameraThread(camInput)
         print("[camera] starting own camera thread")
 
     print(f"gestureControl-config  →  http://localhost:{args.port}")

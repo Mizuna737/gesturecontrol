@@ -12,10 +12,16 @@
     <!-- ── Left panel: live preview ── -->
     <aside id="preview-panel">
       <div id="camera-wrap">
-        <img id="camera-feed" src="/stream" alt="Camera preview">
+        <img id="camera-feed" alt="Camera preview">
         <div id="camera-error" class="hidden">
           <span id="camera-error-text"></span>
         </div>
+      </div>
+
+      <div id="camera-selector">
+        <select id="camera-select" onchange="onCameraChange(this.value)">
+          <option value="">Loading cameras…</option>
+        </select>
       </div>
 
       <div id="hand-states">
@@ -44,7 +50,7 @@
       </div>
 
       <button id="capture-btn" class="btn-secondary" disabled>Capture Pose</button>
-      <p id="capture-hint">Open a pose editor to capture</p>
+      <p id="capture-hint">Show a hand to capture</p>
     </aside>
 
     <!-- ── Right panel: editor ── -->

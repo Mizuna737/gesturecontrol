@@ -79,6 +79,29 @@ body {
   white-space: pre-line;
 }
 
+/* ── Camera selector ── */
+#camera-selector select {
+  width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--surface2);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b7490'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 12px;
+  padding: 6px 28px 6px 8px;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+#camera-selector select:focus,
+#camera-selector select:hover { border-color: var(--accent); }
+#camera-selector select:disabled { opacity: 0.45; cursor: default; }
+#camera-selector select option { background: var(--surface2); color: var(--text); }
+
 /* ── Hand / finger state ── */
 #hand-states {
   display: flex;
@@ -425,7 +448,15 @@ body {
 .field textarea:focus {
   border-color: var(--accent);
 }
-.field select option { background: var(--surface2); }
+.field select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b7490'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+}
+.field select option { background: var(--surface2); color: var(--text); }
 .field textarea { resize: vertical; min-height: 60px; }
 
 .field-row {
@@ -549,14 +580,20 @@ body {
 }
 .step-add-row select {
   flex: 1;
+  appearance: none;
+  -webkit-appearance: none;
   background: var(--surface2);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b7490'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text);
   font-size: 13px;
-  padding: 7px 10px;
+  padding: 7px 28px 7px 10px;
   outline: none;
 }
+.step-add-row select option { background: var(--surface2); color: var(--text); }
 .step-add-row select:focus { border-color: var(--accent); }
 
 /* ── Utility ── */
