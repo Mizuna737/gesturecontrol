@@ -1,4 +1,4 @@
-# Maintainer: Max Hefley <your@email.com>
+# Maintainer: Max Hefley <Mizuna737@gmail.com>
 
 pkgname=gesturecontrol
 pkgver=r1.0
