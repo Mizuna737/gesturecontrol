@@ -20,14 +20,13 @@ jobs:
 
       - name: Compute pkgver and generate .SRCINFO
         run: |
-          # makepkg refuses root — create a throw-away build user
+          PKGVER="r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
+          echo "pkgver: $PKGVER"
+          sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" PKGBUILD
+          # makepkg refuses root — drop to a build user only for this step
           useradd -m builder
           chown -R builder .
-          su builder -c "
-            PKGVER=\"r\$(git rev-list --count HEAD).\$(git rev-parse --short HEAD)\"
-            sed -i \"s/^pkgver=.*/pkgver=\$PKGVER/\" PKGBUILD
-            makepkg --printsrcinfo > .SRCINFO
-          "
+          su builder -c "makepkg --printsrcinfo > .SRCINFO"
 
       - name: Push to AUR
         env:
