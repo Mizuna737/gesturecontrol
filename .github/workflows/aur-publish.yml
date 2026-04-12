@@ -19,6 +19,9 @@ jobs:
         run: pacman -Sy --noconfirm base-devel git openssh
 
       - name: Compute pkgver and generate .SRCINFO
+        working-directory: ${{ github.workspace }}
+        env:
+          GIT_DISCOVERY_ACROSS_FILESYSTEM: '1'
         run: |
           PKGVER="r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
           echo "pkgver: $PKGVER"
