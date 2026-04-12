@@ -34,7 +34,7 @@ jobs:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          printf '%s' "$AUR_SSH_KEY" > ~/.ssh/aur_ci
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur_ci
           chmod 600 ~/.ssh/aur_ci
           ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
 
