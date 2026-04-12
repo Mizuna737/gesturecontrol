@@ -1,11 +1,11 @@
 # Maintainer: Max Hefley <your@email.com>
 
-pkgname=mizuna-gesturecontrol
+pkgname=gesturecontrol
 pkgver=r1.0
 pkgrel=1
 pkgdesc="Hand gesture recognition: webcam → MediaPipe → D-Bus signals → configurable actions"
 arch=('any')
-url="https://github.com/yourusername/mizuna-gesturecontrol"
+url="https://github.com/Mizuna737/gesturecontrol"
 license=('MIT')
 install=gesturecontrol.install
 
@@ -69,7 +69,7 @@ package() {
 
     # ── App launcher entry ──────────────────────────────────────────────────────
     install -Dm644 gesturecontrol.desktop \
-        "$pkgdir/usr/share/applications/mizuna-gesturecontrol.desktop"
+        "$pkgdir/usr/share/applications/gesturecontrol.desktop"
 
     # ── XDG autostart (tray icon on every login) ────────────────────────────────
     install -Dm644 gesturecontrol-autostart.desktop \
