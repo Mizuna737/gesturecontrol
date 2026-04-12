@@ -20,15 +20,12 @@ jobs:
 
       - name: Compute pkgver and generate .SRCINFO
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          cd "$GITHUB_WORKSPACE"
-          PKGVER="r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
+          PKGVER="r${GITHUB_RUN_NUMBER}.${GITHUB_SHA::7}"
           echo "pkgver: $PKGVER"
           sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" PKGBUILD
-          # makepkg refuses root — drop to a build user only for this step
           useradd -m builder
           chown -R builder .
-          su builder -c "cd '$GITHUB_WORKSPACE' && makepkg --printsrcinfo > .SRCINFO"
+          su builder -c "cd $PWD && makepkg --printsrcinfo > .SRCINFO"
 
       - name: Push to AUR
         env:
