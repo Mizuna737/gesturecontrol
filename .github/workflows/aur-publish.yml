@@ -23,6 +23,8 @@ jobs:
           PKGVER="r${GITHUB_RUN_NUMBER}.${GITHUB_SHA::7}"
           echo "pkgver: $PKGVER"
           sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" PKGBUILD
+          # Remove pkgver() so makepkg uses the static value we just set
+          sed -i '/^pkgver()/,/^}/d' PKGBUILD
           useradd -m builder
           chown -R builder .
           su builder -c "cd $PWD && makepkg --printsrcinfo > .SRCINFO"
