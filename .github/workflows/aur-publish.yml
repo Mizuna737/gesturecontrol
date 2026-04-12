@@ -41,7 +41,7 @@ jobs:
           git config --global user.name  "Mizuna737"
           git config --global user.email "Mizuna737@gmail.com"
 
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_ci"
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_ci -o StrictHostKeyChecking=no"
 
           git clone ssh://aur@aur.archlinux.org/gesturecontrol.git /tmp/aur
           cp PKGBUILD .SRCINFO gesturecontrol.install /tmp/aur/
