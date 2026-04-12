@@ -16,7 +16,7 @@ jobs:
           fetch-depth: 0   # full history required for pkgver() rev count
 
       - name: Install build tools
-        run: pacman -Sy --noconfirm base-devel git
+        run: pacman -Sy --noconfirm base-devel git openssh
 
       - name: Compute pkgver and generate .SRCINFO
         run: |
