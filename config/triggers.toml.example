@@ -1,0 +1,92 @@
+[settings]
+camera = 2
+dwell_ms = 200
+format = "GREY"
+
+[[poses]]
+name = "FIST"
+thumb = false
+index = false
+middle = false
+ring = false
+pinky = false
+
+[[poses]]
+name = "FIVE"
+thumb = true
+index = true
+middle = true
+ring = true
+pinky = true
+
+[[poses]]
+name = "SIGN"
+thumb = true
+index = true
+middle = false
+ring = false
+pinky = true
+
+[[poses]]
+name = "THUMBS_UP"
+thumb = true
+index = false
+middle = false
+ring = false
+pinky = false
+
+[[poses]]
+name = "FOUR"
+thumb = false
+index = true
+middle = true
+ring = true
+pinky = true
+
+[[poses]]
+name = "THREE"
+thumb = true
+index = true
+middle = true
+ring = false
+pinky = false
+
+[[poses]]
+name = "TWO"
+thumb = false
+index = true
+middle = true
+ring = false
+pinky = false
+
+[[poses]]
+name = "ONE"
+thumb = false
+index = true
+middle = false
+ring = false
+pinky = false
+
+[[poses]]
+name = "L"
+thumb = true
+index = true
+middle = false
+ring = false
+pinky = false
+
+[[bindings]]
+name = "tag_cycle"
+trigger = { type = "continuous", hand = "left", metric = "pinch_distance", active_while = "THREE", range = [0.15, 0.3] }
+
+[[bindings]]
+name = "set_volume"
+trigger = { active_while = "L", hand = "left", metric = "pinch_distance", range = [0, 0.6], type = "continuous" }
+
+[[bindings]]
+name = "stack_cycle"
+trigger = { type = "continuous", hand = "right", metric = "pinch_distance", active_while = "THREE", range = [0.15, 0.3] }
+
+[[bindings]]
+name = "play_pause"
+trigger = { hand = "left", step_dwell_ms = 5, steps = ["FIVE", "FOUR"], type = "sequence", window_ms = 1500 }

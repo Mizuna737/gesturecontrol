@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gestureControl</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+
+    <!-- ── Left panel: live preview ── -->
+    <aside id="preview-panel">
+      <div id="camera-wrap">
+        <img id="camera-feed" src="/stream" alt="Camera preview">
+        <div id="camera-error" class="hidden">
+          <span id="camera-error-text"></span>
+        </div>
+      </div>
+
+      <div id="hand-states">
+        <div class="hand-row" id="hand-right">
+          <span class="hand-label">R</span>
+          <div class="finger-row">
+            <div class="finger-dot" id="r-thumb"  title="Thumb">T</div>
+            <div class="finger-dot" id="r-index"  title="Index">I</div>
+            <div class="finger-dot" id="r-middle" title="Middle">M</div>
+            <div class="finger-dot" id="r-ring"   title="Ring">R</div>
+            <div class="finger-dot" id="r-pinky"  title="Pinky">P</div>
+          </div>
+          <span class="pose-chip" id="r-pose">---</span>
+        </div>
+        <div class="hand-row" id="hand-left">
+          <span class="hand-label">L</span>
+          <div class="finger-row">
+            <div class="finger-dot" id="l-thumb"  title="Thumb">T</div>
+            <div class="finger-dot" id="l-index"  title="Index">I</div>
+            <div class="finger-dot" id="l-middle" title="Middle">M</div>
+            <div class="finger-dot" id="l-ring"   title="Ring">R</div>
+            <div class="finger-dot" id="l-pinky"  title="Pinky">P</div>
+          </div>
+          <span class="pose-chip" id="l-pose">---</span>
+        </div>
+      </div>
+
+      <button id="capture-btn" class="btn-secondary" disabled>Capture Pose</button>
+      <p id="capture-hint">Open a pose editor to capture</p>
+    </aside>
+
+    <!-- ── Right panel: editor ── -->
+    <main id="editor-panel">
+      <header id="top-bar">
+        <h1>gestureControl</h1>
+        <div id="save-controls">
+          <span id="dirty-badge" class="hidden">unsaved changes</span>
+          <button id="save-btn" class="btn-primary" onclick="saveAll()" disabled>Save</button>
+        </div>
+      </header>
+
+      <nav id="tabs">
+        <button class="tab-btn active" data-tab="poses"    onclick="switchTab('poses')">Poses</button>
+        <button class="tab-btn"        data-tab="triggers" onclick="switchTab('triggers')">Triggers</button>
+        <button class="tab-btn"        data-tab="actions"  onclick="switchTab('actions')">Actions</button>
+      </nav>
+
+      <!-- Poses tab -->
+      <section id="tab-poses" class="tab-pane active">
+        <div id="poses-list" class="item-list"></div>
+        <button class="btn-add" onclick="newPose()">+ New Pose</button>
+      </section>
+
+      <!-- Triggers tab -->
+      <section id="tab-triggers" class="tab-pane">
+        <div id="triggers-list" class="item-list"></div>
+        <button class="btn-add" onclick="newTrigger()">+ New Trigger</button>
+      </section>
+
+      <!-- Actions tab -->
+      <section id="tab-actions" class="tab-pane">
+        <div id="actions-list" class="item-list"></div>
+        <button class="btn-add" onclick="newAction()">+ New Action</button>
+      </section>
+    </main>
+
+  </div><!-- #app -->
+
+  <!-- ── Edit modal ── -->
+  <div id="modal-backdrop" class="hidden" onclick="maybeCloseModal(event)">
+    <div id="modal">
+      <div id="modal-body"></div>
+      <div id="modal-footer">
+        <button class="btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn-primary"   onclick="commitModal()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

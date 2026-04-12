@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Gesture Control
+GenericName=Hand Gesture Recognition
+Comment=Control your desktop with hand gestures via webcam
+Exec=gesturecontrol-tray
+Icon=camera-web
+Categories=Settings;HardwareSettings;Accessibility;
+Keywords=gesture;hand;camera;webcam;recognition;mediapipe;
+StartupNotify=false
+NoDisplay=false

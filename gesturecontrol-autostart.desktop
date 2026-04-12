@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Gesture Control Tray
+Comment=Gesture control system tray icon
+Exec=gesturecontrol-tray
+Icon=camera-web
+X-GNOME-Autostart-enabled=true
+Hidden=false
+NoDisplay=true

@@ -1,0 +1,16 @@
+[Unit]
+Description=Gesture control engine — webcam to D-Bus signals
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/share/gesturecontrol/venv/bin/python3 /usr/share/gesturecontrol/gestureControl.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:%h/.cache/gesturecontrol.log
+StandardError=append:%h/.cache/gesturecontrol.log
+
+[Install]
+WantedBy=graphical-session.target
