@@ -1,0 +1,56 @@
+name: Publish to AUR
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history required for pkgver() rev count
+
+      - name: Install build tools
+        run: pacman -Sy --noconfirm base-devel git
+
+      - name: Compute pkgver and generate .SRCINFO
+        run: |
+          # makepkg refuses root — create a throw-away build user
+          useradd -m builder
+          chown -R builder .
+          su builder -c "
+            PKGVER=\"r\$(git rev-list --count HEAD).\$(git rev-parse --short HEAD)\"
+            sed -i \"s/^pkgver=.*/pkgver=\$PKGVER/\" PKGBUILD
+            makepkg --printsrcinfo > .SRCINFO
+          "
+
+      - name: Push to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s' "$AUR_SSH_KEY" > ~/.ssh/aur_ci
+          chmod 600 ~/.ssh/aur_ci
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+
+          git config --global user.name  "Mizuna737"
+          git config --global user.email "Mizuna737@gmail.com"
+
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_ci"
+
+          git clone ssh://aur@aur.archlinux.org/gesturecontrol.git /tmp/aur
+          cp PKGBUILD .SRCINFO gesturecontrol.install /tmp/aur/
+          cd /tmp/aur
+
+          git add PKGBUILD .SRCINFO gesturecontrol.install
+          if git diff --staged --quiet; then
+            echo "AUR already up to date."
+          else
+            git commit -m "Update to $(grep '^pkgver=' PKGBUILD | cut -d= -f2)-$(grep '^pkgrel=' PKGBUILD | cut -d= -f2)"
+            git push origin master
+          fi
