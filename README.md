@@ -186,6 +186,11 @@ If gestureControl is useful to you, you can support development here:
 
 ---
 
+## **AI Disclosure:** 
+The idea and MVP for the engine was all me. Packaging, UI (Graphic Design is NOT in fact my passion), commit messages, and the readme were a product of Claude Code. If that turns you off for some reason, sorry, but I want to code, not write documentation!
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
