@@ -304,8 +304,8 @@ function renderActions() {
   const list = document.getElementById("actions-list");
   list.innerHTML = "";
   state.actions.forEach((a, i) => {
-    const act = a.action || {};
-    const meta = actionMeta(act);
+    const act  = a.action || {};
+    const meta = [a.context ? `ctx:${a.context}` : null, actionMeta(act)].filter(Boolean).join("  •  ");
     const card = document.createElement("div");
     card.className = "item-card";
     card.innerHTML = `
@@ -331,19 +331,14 @@ function fingerDots(pose) {
 
 function triggerMeta(t) {
   if (!t.type) return "";
-  if (t.type === "pose")       return `pose  •  ${t.hand || "?"}  •  ${t.shape || "?"}`;
-  if (t.type === "continuous") return `continuous  •  ${t.hand || "?"}  •  ${t.metric || "?"}`;
-  if (t.type === "sequence")   return `sequence  •  ${t.hand || "?"}  •  [${(t.steps || []).join(" → ")}]`;
-  if (t.type === "chord")      return `chord  •  L:${t.left || "?"}  +  R:${t.right || "?"}`;
-  return t.type;
+  const d = TRIGGER_TYPES.find(d => d.id === t.type);
+  return d ? d.meta(t) : t.type;
 }
 
 function actionMeta(a) {
   if (!a.type) return "";
-  if (a.type === "exec")        return `exec  •  ${(a.cmd || []).join(" ")}`;
-  if (a.type === "exec_scaled") return `exec_scaled  •  ${a.template || ""}`;
-  if (a.type === "key")         return `key  •  ${a.key || ""}`;
-  return a.type;
+  const d = ACTION_TYPES.find(d => d.id === a.type);
+  return d ? d.meta(a) : a.type;
 }
 
 function esc(str) {
@@ -519,105 +514,196 @@ function poseOptionsWithNone(selected) {
   return `<option value="">— none —</option>` + poseOptions(selected);
 }
 
-function triggerModalHtml(binding) {
-  const name  = binding?.name ?? "";
-  const trig  = binding?.trigger ?? {};
-  const rL    = binding?.require_left  ?? "";
-  const rR    = binding?.require_right ?? "";
-  const type  = trig.type || "pose";
-  const hand  = trig.hand || "either";
-
-  const poseSection = `
-    <div id="trig-pose-section" class="${type !== "pose" ? "hidden" : ""}">
-      <div class="field-row">
-        <div class="field">
-          <label>Shape</label>
-          <select id="trig-shape">${poseOptions(trig.shape || "")}</select>
+// Each entry describes one trigger type: how to render its fields, how to read
+// them back from the DOM, and how to summarise it in the list view.
+// Adding a new trigger type = add one object here; nothing else changes.
+const TRIGGER_TYPES = [
+  {
+    id: "pose",
+    label: "Pose",
+    sectionId: "trig-pose-section",
+    usesHand: true,
+    usesCrossHand: true,
+    fieldsHtml(trig) {
+      return `
+        <div class="field-row">
+          <div class="field">
+            <label>Shape</label>
+            <select id="trig-shape">${poseOptions(trig.shape || "")}</select>
+          </div>
+          <div class="field" style="max-width:110px">
+            <label>Dwell (ms)</label>
+            <input id="trig-dwell" type="number" min="0" step="50" value="${trig.dwell_ms ?? ""}">
+          </div>
+        </div>`;
+    },
+    readFields() {
+      const shape = document.getElementById("trig-shape").value;
+      if (!shape) { alert("Shape is required."); return null; }
+      const dwell = document.getElementById("trig-dwell").value;
+      return { shape, ...(dwell ? { dwell_ms: parseInt(dwell, 10) } : {}) };
+    },
+    meta(t) { return `pose  •  ${t.hand || "?"}  •  ${t.shape || "?"}`; },
+  },
+  {
+    id: "continuous",
+    label: "Continuous",
+    sectionId: "trig-cont-section",
+    usesHand: true,
+    usesCrossHand: true,
+    fieldsHtml(trig) {
+      return `
+        <div class="field-row">
+          <div class="field">
+            <label>Metric</label>
+            <select id="trig-metric">
+              ${METRICS.map(m => `<option value="${m}" ${m === trig.metric ? "selected" : ""}>${m}</option>`).join("")}
+            </select>
+          </div>
+          <div class="field">
+            <label>Active while (pose)</label>
+            <select id="trig-active-while">${poseOptionsWithNone(trig.active_while || "")}</select>
+          </div>
         </div>
-        <div class="field" style="max-width:110px">
+        <div class="field">
+          <label>Range <span style="font-weight:400;color:var(--text-muted)">[min, max] raw sensor value</span></label>
+          <div class="range-row">
+            <input id="trig-range-lo" type="number" step="0.01" placeholder="0.0" value="${trig.range?.[0] ?? ""}">
+            <span class="range-sep">→</span>
+            <input id="trig-range-hi" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
+          </div>
+        </div>`;
+    },
+    readFields() {
+      const metric = document.getElementById("trig-metric").value;
+      const aw     = document.getElementById("trig-active-while").value;
+      const lo     = parseFloat(document.getElementById("trig-range-lo").value);
+      const hi     = parseFloat(document.getElementById("trig-range-hi").value);
+      return {
+        metric,
+        ...(aw ? { active_while: aw } : {}),
+        ...(!isNaN(lo) && !isNaN(hi) ? { range: [lo, hi] } : {}),
+      };
+    },
+    meta(t) { return `continuous  •  ${t.hand || "?"}  •  ${t.metric || "?"}`; },
+  },
+  {
+    id: "sequence",
+    label: "Sequence",
+    sectionId: "trig-seq-section",
+    usesHand: true,
+    usesCrossHand: true,
+    onShow() { renderSteps(); },
+    fieldsHtml(trig) {
+      return `
+        <div class="field">
+          <label>Steps — in order</label>
+          <div id="trig-steps-list"></div>
+          <div class="step-add-row">
+            <select id="trig-step-select">${poseOptions("")}</select>
+            <button class="btn-secondary" style="white-space:nowrap" onclick="addStep()">+ Add Step</button>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Window (ms) <span style="font-weight:400;color:var(--text-muted)">max time to complete</span></label>
+            <input id="trig-window-ms" type="number" min="100" step="100" value="${trig.window_ms ?? 1500}">
+          </div>
+          <div class="field">
+            <label>Step dwell (ms)</label>
+            <input id="trig-step-dwell-ms" type="number" min="0" step="10" value="${trig.step_dwell_ms ?? 100}">
+          </div>
+        </div>`;
+    },
+    readFields() {
+      if (editingSteps.length < 2) { alert("A sequence needs at least two steps."); return null; }
+      return {
+        steps:         [...editingSteps],
+        window_ms:     parseInt(document.getElementById("trig-window-ms").value, 10)     || 1500,
+        step_dwell_ms: parseInt(document.getElementById("trig-step-dwell-ms").value, 10) || 100,
+      };
+    },
+    meta(t) { return `sequence  •  ${t.hand || "?"}  •  [${(t.steps || []).join(" → ")}]`; },
+  },
+  {
+    id: "swipe",
+    label: "Swipe",
+    sectionId: "trig-swipe-section",
+    usesHand: true,
+    usesCrossHand: true,
+    fieldsHtml(trig) {
+      return `
+        <div class="field-row">
+          <div class="field">
+            <label>Direction</label>
+            <select id="trig-swipe-direction">
+              <option value="left"  ${(trig.direction || "left") === "left"  ? "selected" : ""}>Left</option>
+              <option value="right" ${trig.direction === "right" ? "selected" : ""}>Right</option>
+            </select>
+          </div>
+          <div class="field" style="max-width:160px">
+            <label>Min displacement <span style="font-weight:400;color:var(--text-muted)">0.0–1.0</span></label>
+            <input id="trig-swipe-min-disp" type="number" step="0.05" min="0" max="1"
+                   value="${trig.min_displacement ?? 0.3}">
+          </div>
+        </div>`;
+    },
+    readFields() {
+      const direction = document.getElementById("trig-swipe-direction").value;
+      const minDisp   = parseFloat(document.getElementById("trig-swipe-min-disp").value);
+      return { direction, ...(!isNaN(minDisp) ? { min_displacement: minDisp } : {}) };
+    },
+    meta(t) { return `swipe  •  ${t.hand || "?"}  •  ${t.direction || "?"}`; },
+  },
+  {
+    id: "chord",
+    label: "Chord",
+    sectionId: "trig-chord-section",
+    usesHand: false,
+    usesCrossHand: false,
+    fieldsHtml(trig) {
+      return `
+        <div class="field-row">
+          <div class="field">
+            <label>Left hand pose</label>
+            <select id="trig-chord-left">${poseOptions(trig.left || "")}</select>
+          </div>
+          <div class="field">
+            <label>Right hand pose</label>
+            <select id="trig-chord-right">${poseOptions(trig.right || "")}</select>
+          </div>
+        </div>
+        <div class="field" style="max-width:150px">
           <label>Dwell (ms)</label>
-          <input id="trig-dwell" type="number" min="0" step="50" value="${trig.dwell_ms ?? ""}">
-        </div>
-      </div>
-    </div>`;
+          <input id="trig-chord-dwell" type="number" min="0" step="50" value="${trig.dwell_ms ?? ""}">
+        </div>`;
+    },
+    readFields() {
+      const left  = document.getElementById("trig-chord-left").value;
+      const right = document.getElementById("trig-chord-right").value;
+      if (!left || !right) { alert("Both hand poses are required for a chord."); return null; }
+      const dwell = document.getElementById("trig-chord-dwell").value;
+      return { left, right, ...(dwell ? { dwell_ms: parseInt(dwell, 10) } : {}) };
+    },
+    meta(t) { return `chord  •  L:${t.left || "?"}  +  R:${t.right || "?"}`; },
+  },
+];
 
-  const contSection = `
-    <div id="trig-cont-section" class="${type !== "continuous" ? "hidden" : ""}">
-      <div class="field-row">
-        <div class="field">
-          <label>Metric</label>
-          <select id="trig-metric">
-            ${METRICS.map(m => `<option value="${m}" ${m === trig.metric ? "selected" : ""}>${m}</option>`).join("")}
-          </select>
-        </div>
-        <div class="field">
-          <label>Active while (pose)</label>
-          <select id="trig-active-while">${poseOptionsWithNone(trig.active_while || "")}</select>
-        </div>
-      </div>
-      <div class="field">
-        <label>Range <span style="font-weight:400;color:var(--text-muted)">[min, max] raw sensor value</span></label>
-        <div class="range-row">
-          <input id="trig-range-lo" type="number" step="0.01" placeholder="0.0" value="${trig.range?.[0] ?? ""}">
-          <span class="range-sep">→</span>
-          <input id="trig-range-hi" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
-        </div>
-      </div>
-    </div>`;
+function triggerModalHtml(binding) {
+  const name = binding?.name ?? "";
+  const trig = binding?.trigger ?? {};
+  const rL   = binding?.require_left  ?? "";
+  const rR   = binding?.require_right ?? "";
+  const type = trig.type || "pose";
+  const hand = trig.hand || "either";
 
-  const seqSection = `
-    <div id="trig-seq-section" class="${type !== "sequence" ? "hidden" : ""}">
-      <div class="field">
-        <label>Steps — in order</label>
-        <div id="trig-steps-list"></div>
-        <div class="step-add-row">
-          <select id="trig-step-select">${poseOptions("")}</select>
-          <button class="btn-secondary" style="white-space:nowrap" onclick="addStep()">+ Add Step</button>
-        </div>
-      </div>
-      <div class="field-row">
-        <div class="field">
-          <label>Window (ms) <span style="font-weight:400;color:var(--text-muted)">max time to complete</span></label>
-          <input id="trig-window-ms" type="number" min="100" step="100" value="${trig.window_ms ?? 1500}">
-        </div>
-        <div class="field">
-          <label>Step dwell (ms)</label>
-          <input id="trig-step-dwell-ms" type="number" min="0" step="10" value="${trig.step_dwell_ms ?? 100}">
-        </div>
-      </div>
-    </div>`;
-
-  const chordSection = `
-    <div id="trig-chord-section" class="${type !== "chord" ? "hidden" : ""}">
-      <div class="field-row">
-        <div class="field">
-          <label>Left hand pose</label>
-          <select id="trig-chord-left">${poseOptions(trig.left || "")}</select>
-        </div>
-        <div class="field">
-          <label>Right hand pose</label>
-          <select id="trig-chord-right">${poseOptions(trig.right || "")}</select>
-        </div>
-      </div>
-      <div class="field" style="max-width:150px">
-        <label>Dwell (ms)</label>
-        <input id="trig-chord-dwell" type="number" min="0" step="50" value="${trig.dwell_ms ?? ""}">
-      </div>
-    </div>`;
-
-  const crossHandRow = `
-    <div id="trig-cross-hand-row" class="${type === "chord" ? "hidden" : ""}">
-      <div class="field-row">
-        <div class="field">
-          <label>Require left hand (optional)</label>
-          <select id="trig-req-left">${poseOptionsWithNone(rL)}</select>
-        </div>
-        <div class="field">
-          <label>Require right hand (optional)</label>
-          <select id="trig-req-right">${poseOptionsWithNone(rR)}</select>
-        </div>
-      </div>
-    </div>`;
+  const descriptor  = TRIGGER_TYPES.find(t => t.id === type);
+  const typeOptions = TRIGGER_TYPES.map(t =>
+    `<option value="${t.id}" ${t.id === type ? "selected" : ""}>${t.label}</option>`
+  ).join("");
+  const sections = TRIGGER_TYPES.map(t =>
+    `<div id="${t.sectionId}" class="${t.id !== type ? "hidden" : ""}">${t.fieldsHtml(trig)}</div>`
+  ).join("");
 
   return `
     <div class="modal-title">${binding ? "Edit Trigger" : "New Trigger"}</div>
@@ -629,13 +715,10 @@ function triggerModalHtml(binding) {
       <div class="field">
         <label>Trigger type</label>
         <select id="trig-type" onchange="onTriggerTypeChange(this.value)">
-          <option value="pose"       ${type === "pose"       ? "selected" : ""}>Pose</option>
-          <option value="continuous" ${type === "continuous" ? "selected" : ""}>Continuous</option>
-          <option value="sequence"   ${type === "sequence"   ? "selected" : ""}>Sequence</option>
-          <option value="chord"      ${type === "chord"      ? "selected" : ""}>Chord</option>
+          ${typeOptions}
         </select>
       </div>
-      <div id="trig-hand-field" class="field ${type === "chord" ? "hidden" : ""}">
+      <div id="trig-hand-field" class="field ${descriptor?.usesHand ? "" : "hidden"}">
         <label>Hand</label>
         <select id="trig-hand">
           <option value="either" ${hand === "either" ? "selected" : ""}>Either</option>
@@ -644,22 +727,30 @@ function triggerModalHtml(binding) {
         </select>
       </div>
     </div>
-    ${poseSection}
-    ${contSection}
-    ${seqSection}
-    ${chordSection}
+    ${sections}
     <hr class="divider">
-    ${crossHandRow}`;
+    <div id="trig-cross-hand-row" class="${descriptor?.usesCrossHand ? "" : "hidden"}">
+      <div class="field-row">
+        <div class="field">
+          <label>Require left hand (optional)</label>
+          <select id="trig-req-left">${poseOptionsWithNone(rL)}</select>
+        </div>
+        <div class="field">
+          <label>Require right hand (optional)</label>
+          <select id="trig-req-right">${poseOptionsWithNone(rR)}</select>
+        </div>
+      </div>
+    </div>`;
 }
 
 function onTriggerTypeChange(type) {
-  document.getElementById("trig-pose-section")?.classList.toggle("hidden",  type !== "pose");
-  document.getElementById("trig-cont-section")?.classList.toggle("hidden",  type !== "continuous");
-  document.getElementById("trig-seq-section")?.classList.toggle("hidden",   type !== "sequence");
-  document.getElementById("trig-chord-section")?.classList.toggle("hidden", type !== "chord");
-  document.getElementById("trig-hand-field")?.classList.toggle("hidden",    type === "chord");
-  document.getElementById("trig-cross-hand-row")?.classList.toggle("hidden", type === "chord");
-  if (type === "sequence") renderSteps();
+  const descriptor = TRIGGER_TYPES.find(t => t.id === type);
+  TRIGGER_TYPES.forEach(t => {
+    document.getElementById(t.sectionId)?.classList.toggle("hidden", t.id !== type);
+  });
+  document.getElementById("trig-hand-field")?.classList.toggle("hidden",     !descriptor?.usesHand);
+  document.getElementById("trig-cross-hand-row")?.classList.toggle("hidden", !descriptor?.usesCrossHand);
+  descriptor?.onShow?.();
 }
 
 // ── Sequence step management ───────────────────────────────────────────────────
@@ -705,14 +796,14 @@ function moveStep(i, dir) {
 function newTrigger() {
   editingSteps = [];
   openModal(triggerModalHtml(null), { type: "trigger", index: -1 });
-  renderSteps();
 }
 
 function editTrigger(i) {
-  const trig = state.triggers[i]?.trigger ?? {};
+  const trig       = state.triggers[i]?.trigger ?? {};
+  const descriptor = TRIGGER_TYPES.find(t => t.id === trig.type);
   editingSteps = trig.type === "sequence" ? [...(trig.steps || [])] : [];
   openModal(triggerModalHtml(state.triggers[i]), { type: "trigger", index: i });
-  if (trig.type === "sequence") renderSteps();
+  descriptor?.onShow?.();
 }
 
 function deleteTrigger(i, evt) {
@@ -726,42 +817,16 @@ function commitTrigger(index) {
   const name = document.getElementById("trig-name").value.trim();
   if (!name) { alert("Trigger name is required."); return; }
 
-  const type = document.getElementById("trig-type").value;
-  const hand = document.getElementById("trig-hand").value;
+  const type       = document.getElementById("trig-type").value;
+  const descriptor = TRIGGER_TYPES.find(t => t.id === type);
+  const typeFields = descriptor?.readFields();
+  if (typeFields == null) return;
 
-  let trigger;
+  const trigger = { type, ...typeFields };
+  if (descriptor.usesHand) trigger.hand = document.getElementById("trig-hand").value;
 
-  if (type === "chord") {
-    const left  = document.getElementById("trig-chord-left").value;
-    const right = document.getElementById("trig-chord-right").value;
-    if (!left || !right) { alert("Both hand poses are required for a chord."); return; }
-    const dwell = document.getElementById("trig-chord-dwell").value;
-    trigger = { type, left, right, ...(dwell ? { dwell_ms: parseInt(dwell, 10) } : {}) };
-  } else {
-    const hand = document.getElementById("trig-hand").value;
-    trigger = { type, hand };
-
-    if (type === "pose") {
-      trigger.shape = document.getElementById("trig-shape").value;
-      const dwell   = document.getElementById("trig-dwell").value;
-      if (dwell) trigger.dwell_ms = parseInt(dwell, 10);
-    } else if (type === "continuous") {
-      trigger.metric = document.getElementById("trig-metric").value;
-      const aw = document.getElementById("trig-active-while").value;
-      if (aw) trigger.active_while = aw;
-      const lo = parseFloat(document.getElementById("trig-range-lo").value);
-      const hi = parseFloat(document.getElementById("trig-range-hi").value);
-      if (!isNaN(lo) && !isNaN(hi)) trigger.range = [lo, hi];
-    } else if (type === "sequence") {
-      if (editingSteps.length < 2) { alert("A sequence needs at least two steps."); return; }
-      trigger.steps         = [...editingSteps];
-      trigger.window_ms     = parseInt(document.getElementById("trig-window-ms").value, 10)     || 1500;
-      trigger.step_dwell_ms = parseInt(document.getElementById("trig-step-dwell-ms").value, 10) || 100;
-    }
-  }
-
-  const reqL = type !== "chord" ? document.getElementById("trig-req-left")?.value  : "";
-  const reqR = type !== "chord" ? document.getElementById("trig-req-right")?.value : "";
+  const reqL = descriptor.usesCrossHand ? document.getElementById("trig-req-left")?.value  : "";
+  const reqR = descriptor.usesCrossHand ? document.getElementById("trig-req-right")?.value : "";
 
   const binding = {
     name,
@@ -781,6 +846,69 @@ function commitTrigger(index) {
 
 // ── Action editing ────────────────────────────────────────────────────────────
 
+// Each entry describes one action type: how to render its fields, how to read
+// them back from the DOM, and how to summarise it in the list view.
+// Adding a new action type = add one object here; nothing else changes.
+const ACTION_TYPES = [
+  {
+    id: "exec",
+    label: "exec — run a command",
+    sectionSuffix: "exec-section",
+    fieldsHtml(pfx, act, hidden) {
+      return `
+        <div id="${pfx}-exec-section" class="${hidden ? "hidden" : ""} field">
+          <label>Command <span style="font-weight:400;color:var(--text-muted)">— space-separated args</span></label>
+          <input id="${pfx}-cmd" type="text" placeholder="playerctl play-pause"
+                 value="${esc((act?.cmd || []).join(" "))}">
+        </div>`;
+    },
+    readFields(pfx) {
+      const raw = document.getElementById(`${pfx}-cmd`)?.value.trim();
+      if (!raw) return null;
+      return { type: "exec", cmd: raw.split(/\s+/) };
+    },
+    meta(a) { return `exec  •  ${(a.cmd || []).join(" ")}`; },
+  },
+  {
+    id: "exec_scaled",
+    label: "exec_scaled — command with {value}",
+    sectionSuffix: "exec-scaled-section",
+    fieldsHtml(pfx, act, hidden) {
+      return `
+        <div id="${pfx}-exec-scaled-section" class="${hidden ? "hidden" : ""} field">
+          <label>Template <span style="font-weight:400;color:var(--text-muted)">— {value} is 0.0–1.0</span></label>
+          <input id="${pfx}-template" type="text" placeholder="pactl set-sink-volume @DEFAULT_SINK@ {value:.0%}"
+                 value="${esc(act?.template || "")}">
+        </div>`;
+    },
+    readFields(pfx) {
+      const tmpl = document.getElementById(`${pfx}-template`)?.value.trim();
+      if (!tmpl) return null;
+      return { type: "exec_scaled", template: tmpl };
+    },
+    meta(a) { return `exec_scaled  •  ${a.template || ""}`; },
+  },
+  {
+    id: "key",
+    label: "key — synthesize keypress",
+    sectionSuffix: "key-section",
+    fieldsHtml(pfx, act, hidden) {
+      return `
+        <div id="${pfx}-key-section" class="${hidden ? "hidden" : ""} field">
+          <label>Key name <span style="font-weight:400;color:var(--text-muted)">— xdotool key name</span></label>
+          <input id="${pfx}-key" type="text" placeholder="XF86AudioPlay"
+                 value="${esc(act?.key || "")}">
+        </div>`;
+    },
+    readFields(pfx) {
+      const key = document.getElementById(`${pfx}-key`)?.value.trim();
+      if (!key) return null;
+      return { type: "key", key };
+    },
+    meta(a) { return `key  •  ${a.key || ""}`; },
+  },
+];
+
 function signalOptions(selected) {
   return state.triggers.map(t =>
     `<option value="${esc(t.name)}" ${t.name === selected ? "selected" : ""}>${esc(t.name)}</option>`
@@ -789,36 +917,24 @@ function signalOptions(selected) {
 
 function actionFieldsHtml(prefix, act) {
   const type = act?.type || "exec";
+  const typeOptions = ACTION_TYPES.map(t =>
+    `<option value="${t.id}" ${t.id === type ? "selected" : ""}>${t.label}</option>`
+  ).join("");
+  const sections = ACTION_TYPES.map(t => t.fieldsHtml(prefix, act, t.id !== type)).join("");
   return `
     <div class="field">
       <label>Action type</label>
       <select id="${prefix}-type" onchange="onActionTypeChange('${prefix}', this.value)">
-        <option value="exec"        ${type === "exec"        ? "selected" : ""}>exec — run a command</option>
-        <option value="exec_scaled" ${type === "exec_scaled" ? "selected" : ""}>exec_scaled — command with {value}</option>
-        <option value="key"         ${type === "key"         ? "selected" : ""}>key — synthesize keypress</option>
+        ${typeOptions}
       </select>
     </div>
-    <div id="${prefix}-exec-section"        class="${type !== "exec"        ? "hidden" : ""} field">
-      <label>Command <span style="font-weight:400;color:var(--text-muted)">— space-separated args</span></label>
-      <input id="${prefix}-cmd" type="text" placeholder="playerctl play-pause"
-             value="${esc((act?.cmd || []).join(" "))}">
-    </div>
-    <div id="${prefix}-exec-scaled-section" class="${type !== "exec_scaled" ? "hidden" : ""} field">
-      <label>Template <span style="font-weight:400;color:var(--text-muted)">— {value} is 0.0–1.0</span></label>
-      <input id="${prefix}-template" type="text" placeholder="pactl set-sink-volume @DEFAULT_SINK@ {value:.0%}"
-             value="${esc(act?.template || "")}">
-    </div>
-    <div id="${prefix}-key-section"         class="${type !== "key"         ? "hidden" : ""} field">
-      <label>Key name <span style="font-weight:400;color:var(--text-muted)">— xdotool key name</span></label>
-      <input id="${prefix}-key" type="text" placeholder="XF86AudioPlay"
-             value="${esc(act?.key || "")}">
-    </div>`;
+    ${sections}`;
 }
 
 function onActionTypeChange(prefix, type) {
-  document.getElementById(`${prefix}-exec-section`)?.classList.toggle("hidden",        type !== "exec");
-  document.getElementById(`${prefix}-exec-scaled-section`)?.classList.toggle("hidden", type !== "exec_scaled");
-  document.getElementById(`${prefix}-key-section`)?.classList.toggle("hidden",         type !== "key");
+  ACTION_TYPES.forEach(t => {
+    document.getElementById(`${prefix}-${t.sectionSuffix}`)?.classList.toggle("hidden", t.id !== type);
+  });
 }
 
 function isContinuousTrigger(signalName) {
@@ -830,6 +946,7 @@ function actionModalHtml(binding) {
   const signal  = binding?.signal  ?? "";
   const act     = binding?.action  ?? {};
   const onEnd   = binding?.on_end  ?? null;
+  const context = binding?.context ?? "";
   const isCont  = isContinuousTrigger(signal);
 
   return `
@@ -839,6 +956,10 @@ function actionModalHtml(binding) {
       <select id="action-signal" onchange="onActionSignalChange(this.value)">
         ${signalOptions(signal)}
       </select>
+    </div>
+    <div class="field">
+      <label>Context <span style="font-weight:400;color:var(--text-muted)">— WM_CLASS substring; leave empty to always fire</span></label>
+      <input id="action-context" type="text" value="${esc(context)}" placeholder="e.g. qutebrowser">
     </div>
     ${actionFieldsHtml("act", act)}
     <div id="on-end-section" class="${!isCont ? "hidden" : ""}">
@@ -856,27 +977,12 @@ function onActionSignalChange(signal) {
 }
 
 function readActionFields(prefix) {
-  const type = document.getElementById(`${prefix}-type`)?.value;
-  if (!type) return null;
-  if (type === "exec") {
-    const raw = document.getElementById(`${prefix}-cmd`)?.value.trim();
-    if (!raw) return null;
-    return { type: "exec", cmd: raw.split(/\s+/) };
-  }
-  if (type === "exec_scaled") {
-    const tmpl = document.getElementById(`${prefix}-template`)?.value.trim();
-    if (!tmpl) return null;
-    return { type: "exec_scaled", template: tmpl };
-  }
-  if (type === "key") {
-    const key = document.getElementById(`${prefix}-key`)?.value.trim();
-    if (!key) return null;
-    return { type: "key", key };
-  }
-  return null;
+  const type       = document.getElementById(`${prefix}-type`)?.value;
+  const descriptor = ACTION_TYPES.find(t => t.id === type);
+  return descriptor?.readFields(prefix) ?? null;
 }
 
-function newAction()     { openModal(actionModalHtml(null),            { type: "action", index: -1 }); }
+function newAction()     { openModal(actionModalHtml(null),             { type: "action", index: -1 }); }
 function editAction(i)   { openModal(actionModalHtml(state.actions[i]), { type: "action", index: i }); }
 
 function deleteAction(i, evt) {
@@ -893,9 +999,15 @@ function commitAction(index) {
   const action = readActionFields("act");
   if (!action) { alert("Action is incomplete."); return; }
 
-  const onEnd  = readActionFields("end");
+  const onEnd   = readActionFields("end");
+  const context = document.getElementById("action-context")?.value.trim();
 
-  const binding = { signal, action, ...(onEnd ? { on_end: onEnd } : {}) };
+  const binding = {
+    signal,
+    ...(context ? { context } : {}),
+    action,
+    ...(onEnd ? { on_end: onEnd } : {}),
+  };
 
   if (index === -1) state.actions.push(binding);
   else              state.actions[index] = binding;

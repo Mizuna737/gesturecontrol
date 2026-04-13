@@ -23,6 +23,7 @@ if sys.executable != _VENV and os.path.exists(_VENV):
 import argparse
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,6 +55,7 @@ class ActionBinding:
     signal: str         # gesture name to listen for
     action: object      # ExecAction, ExecScaledAction, or KeyAction
     onEnd:  object = None  # optional action fired on ContinuousEnd for this signal
+    context: str | None = None  # WM_CLASS substring to match; None = always fire
 
 # ── Config loading ─────────────────────────────────────────────────────────────
 
@@ -80,8 +82,35 @@ def loadConfig(path):
             signal=item["signal"],
             action=action,
             onEnd=onEnd,
+            context=item.get("context"),
         )
     return bindings
+
+# ── Focus context ─────────────────────────────────────────────────────────────
+
+_focusCache = {"wmClass": "", "ts": 0.0}
+
+def getFocusedWindowClass():
+    now = time.monotonic()
+    if now - _focusCache["ts"] < 0.1:
+        return _focusCache["wmClass"]
+    try:
+        result = subprocess.run(
+            ["xdotool", "getactivewindow", "getwindowclassname"],
+            capture_output=True, text=True, timeout=0.1,
+        )
+        _focusCache["wmClass"] = result.stdout.strip().lower()
+        _focusCache["ts"] = now
+    except Exception:
+        pass
+    return _focusCache["wmClass"]
+
+def contextMatches(context):
+    """Return True if context (WM_CLASS substring) matches the focused window."""
+    if not context:
+        return True
+    return context.lower() in getFocusedWindowClass()
+
 
 # ── Action execution ───────────────────────────────────────────────────────────
 
@@ -111,20 +140,20 @@ def dispatchAction(action, value=None):
 
 def onGestureFired(name, hand, bindings):
     binding = bindings.get(str(name))
-    if not binding:
+    if not binding or not contextMatches(binding.context):
         return
     print(f"[action] GestureFired     {name}  ({hand})")
     dispatchAction(binding.action)
 
 def onContinuousUpdate(name, hand, value, bindings):
     binding = bindings.get(str(name))
-    if not binding:
+    if not binding or not contextMatches(binding.context):
         return
     dispatchAction(binding.action, value=float(value))
 
 def onContinuousEnd(name, hand, bindings):
     binding = bindings.get(str(name))
-    if not binding or not binding.onEnd:
+    if not binding or not binding.onEnd or not contextMatches(binding.context):
         return
     print(f"[action] ContinuousEnd    {name}  ({hand})")
     dispatchAction(binding.onEnd)

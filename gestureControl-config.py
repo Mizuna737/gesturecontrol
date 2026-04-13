@@ -295,6 +295,8 @@ def serializeActionsTOML(data):
     for binding in data.get("bindings", []):
         lines.append("[[bindings]]")
         lines.append(f'signal = "{binding["signal"]}"')
+        if binding.get("context"):
+            lines.append(f'context = "{binding["context"]}"')
         lines.append(f"action = {_inlineTable(binding['action'])}")
         if binding.get("on_end"):
             lines.append(f"on_end = {_inlineTable(binding['on_end'])}")

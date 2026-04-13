@@ -90,3 +90,7 @@ trigger = { type = "continuous", hand = "right", metric = "pinch_distance", acti
 [[bindings]]
 name = "play_pause"
 trigger = { hand = "left", step_dwell_ms = 5, steps = ["FIVE", "FOUR"], type = "sequence", window_ms = 1500 }
+
+[[bindings]]
+name = "browser_back"
+trigger = { type = "swipe", hand = "right", direction = "left", min_displacement = 0.3 }

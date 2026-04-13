@@ -42,8 +42,8 @@ The tray icon autostarts on login via XDG autostart.
 The config UI (accessible from the tray) lets you define everything visually with a live camera preview:
 
 - **Poses** — define finger states (which fingers are extended) and give them names
-- **Triggers** — bind poses to events: one-shot, held continuous, chord (two hands), or sequence
-- **Actions** — map trigger signals to commands, keypresses, or scaled values
+- **Triggers** — bind poses to events: one-shot, held continuous, chord (two hands), sequence, or swipe
+- **Actions** — map trigger signals to commands, keypresses, or scaled values; optionally scoped to a specific focused window
 
 Config files live at `~/.config/gesturecontrol/`:
 
@@ -53,6 +53,33 @@ Config files live at `~/.config/gesturecontrol/`:
 | `actions.toml`  | What to do when a signal fires   |
 
 Changes are picked up live — no restart needed.
+
+### Swipe triggers
+
+Fire when the hand moves in a direction (optionally requiring a pose first):
+
+```toml
+# triggers.toml
+[[bindings]]
+name = "browser_back"
+trigger = { type = "swipe", hand = "right", direction = "left", min_displacement = 0.3 }
+```
+
+Valid directions: `left`, `right`, `up`, `down`. `min_displacement` is a fraction of the frame width.
+
+### Context-aware actions
+
+Action bindings accept an optional `context` field — a WM_CLASS substring. When set, the action only fires if that string appears in the focused window's class name:
+
+```toml
+# actions.toml
+[[bindings]]
+signal = "browser_back"
+context = "qutebrowser"
+action = { type = "key", key = "shift+h" }
+```
+
+Requires `xdotool` (listed under optional dependencies).
 
 ### Example: media controls
 

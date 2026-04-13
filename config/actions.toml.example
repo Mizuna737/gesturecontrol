@@ -1,3 +1,8 @@
 [[bindings]]
 signal = "play_pause"
 action = { cmd = ["playerctl", "play-pause"], type = "exec" }
+
+[[bindings]]
+signal = "browser_back"
+context = "qutebrowser"
+action = { type = "key", key = "shift+h" }

@@ -129,12 +129,38 @@ class PoseTrigger:
     shape: str  # pose name, e.g. "ONE", "FIST"
     dwellMs: int  # ms the pose must be held before firing
 
+    @classmethod
+    def parse(cls, d, defaultDwellMs):
+        return cls(hand=d.get("hand", "right"), shape=d["shape"],
+                   dwellMs=d.get("dwell_ms", defaultDwellMs))
+
+    def buildState(self):
+        return BindingState(debouncer=DwellDebouncer(self.dwellMs))
+
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+        pose = None if suppress else getPoseForHand(handData, self.hand)
+        if bState.debouncer.update(pose if pose == self.shape else None):
+            publisher.gestureFired(name, self.hand)
+
 
 @dataclass
 class SwipeTrigger:
     hand: str
     direction: str  # "LEFT_SWIPE" or "RIGHT_SWIPE" (normalised from config)
     minDisplacement: float  # normalised x displacement required
+
+    @classmethod
+    def parse(cls, d, defaultDwellMs):
+        return cls(hand=d.get("hand", "right"),
+                   direction=d["direction"].upper() + "_SWIPE",
+                   minDisplacement=d.get("min_displacement", 0.15))
+
+    def buildState(self):
+        return BindingState()
+
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+        if not suppress and getSwipeForHand(handData, self.hand) == self.direction:
+            publisher.gestureFired(name, self.hand)
 
 
 @dataclass
@@ -143,6 +169,24 @@ class SequenceTrigger:
     steps: list  # ordered pose names, e.g. ["FIST", "THUMBS_UP"]
     windowMs: int  # max ms between first and last step completion
     stepDwellMs: int  # ms each individual step must be held to register
+
+    @classmethod
+    def parse(cls, d, defaultDwellMs):
+        return cls(hand=d.get("hand", "right"), steps=d["steps"],
+                   windowMs=d["window_ms"], stepDwellMs=d.get("step_dwell_ms", 100))
+
+    def buildState(self):
+        return BindingState(sequenceTracker=SequenceTracker(
+            self.steps, self.windowMs, self.stepDwellMs))
+
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+        # Pass None when suppressed so in-progress sequences don't advance.
+        pose = None if suppress else getPoseForHand(handData, self.hand)
+        stepsCompleted, done = bState.sequenceTracker.update(pose, timestampMs)
+        if stepsCompleted:
+            publisher.sequenceProgress(name, self.hand, stepsCompleted, len(self.steps))
+        if done:
+            publisher.gestureFired(name, self.hand)
 
 
 @dataclass
@@ -154,12 +198,45 @@ class ContinuousTrigger:
     )  # pose name that must be held to activate this trigger; None = no same-hand pose requirement
     valueRange: tuple  # (low, high) raw sensor range to normalise across [0, 1]
 
+    @classmethod
+    def parse(cls, d, defaultDwellMs):
+        return cls(hand=d.get("hand", "right"), metric=d["metric"],
+                   activeWhile=d.get("active_while"),
+                   valueRange=parseRange(d["range"]) if "range" in d else (0.0, 1.0))
+
+    def buildState(self):
+        return BindingState(continuousTracker=ContinuousTracker(self))
+
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+        result = handData.get(self.hand) or _emptyResult()
+        value, ended = bState.continuousTracker.update(
+            result.pose, result.metrics, timestampMs, enabled=condsMet and not suppress)
+        if value is not None:
+            publisher.continuousUpdate(name, self.hand, value)
+        if ended:
+            publisher.continuousEnd(name, self.hand)
+
 
 @dataclass
 class ChordTrigger:
     left: str  # pose name required on left hand simultaneously
     right: str  # pose name required on right hand simultaneously
     dwellMs: int
+
+    @classmethod
+    def parse(cls, d, defaultDwellMs):
+        return cls(left=d["left"], right=d["right"],
+                   dwellMs=d.get("dwell_ms", defaultDwellMs))
+
+    def buildState(self):
+        return BindingState(debouncer=DwellDebouncer(self.dwellMs))
+
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+        leftResult  = handData.get("left")  or _emptyResult()
+        rightResult = handData.get("right") or _emptyResult()
+        chordHeld = leftResult.pose == self.left and rightResult.pose == self.right
+        if bState.debouncer.update("chord" if chordHeld else None):
+            publisher.gestureFired(name, "both")
 
 
 @dataclass
@@ -192,46 +269,22 @@ def parseRange(raw):
     return (float(raw[0]), float(raw[1]))
 
 
-def parseTrigger(d, defaultDwellMs):
-    """Build the appropriate trigger dataclass from a raw config dict."""
-    kind = d["type"]
-    hand = d.get("hand", "right")
+_TRIGGER_CLASSES = {
+    "pose":       PoseTrigger,
+    "swipe":      SwipeTrigger,
+    "sequence":   SequenceTrigger,
+    "continuous": ContinuousTrigger,
+    "chord":      ChordTrigger,
+}
 
-    if kind == "pose":
-        return PoseTrigger(
-            hand=hand,
-            shape=d["shape"],
-            dwellMs=d.get("dwell_ms", defaultDwellMs),
-        )
-    if kind == "swipe":
-        # Config uses "left"/"right"; normalise to internal "LEFT_SWIPE"/"RIGHT_SWIPE"
-        direction = d["direction"].upper() + "_SWIPE"
-        return SwipeTrigger(
-            hand=hand,
-            direction=direction,
-            minDisplacement=d.get("min_displacement", 0.15),
-        )
-    if kind == "sequence":
-        return SequenceTrigger(
-            hand=hand,
-            steps=d["steps"],
-            windowMs=d["window_ms"],
-            stepDwellMs=d.get("step_dwell_ms", 100),
-        )
-    if kind == "continuous":
-        return ContinuousTrigger(
-            hand=hand,
-            metric=d["metric"],
-            activeWhile=d.get("active_while"),  # None = no same-hand pose requirement
-            valueRange=parseRange(d["range"]) if "range" in d else (0.0, 1.0),
-        )
-    if kind == "chord":
-        return ChordTrigger(
-            left=d["left"],
-            right=d["right"],
-            dwellMs=d.get("dwell_ms", defaultDwellMs),
-        )
-    raise ValueError(f"Unknown trigger type: {kind!r}")
+
+def parseTrigger(d, defaultDwellMs):
+    """Dispatch to the appropriate trigger class's parse() classmethod."""
+    kind = d["type"]
+    cls = _TRIGGER_CLASSES.get(kind)
+    if cls is None:
+        raise ValueError(f"Unknown trigger type: {kind!r}")
+    return cls.parse(d, defaultDwellMs)
 
 
 def parsePose(d):
@@ -595,25 +648,17 @@ class ContinuousTracker:
 class BindingState:
     """Mutable per-binding state initialised at startup."""
 
-    binding: Binding
+    binding: Binding = None  # set by buildBindingState after trigger.buildState()
     debouncer: object = None  # DwellDebouncer — pose and chord bindings
     sequenceTracker: object = None  # SequenceTracker — sequence bindings
     continuousTracker: object = None  # ContinuousTracker — continuous bindings
 
 
 def buildBindingState(binding, defaultDwellMs):
-    """Create a BindingState with the correct state object for the trigger type."""
-    t = binding.trigger
-    state = BindingState(binding=binding)
-    if isinstance(t, PoseTrigger):
-        state.debouncer = DwellDebouncer(t.dwellMs)
-    elif isinstance(t, SequenceTrigger):
-        state.sequenceTracker = SequenceTracker(t.steps, t.windowMs, t.stepDwellMs)
-    elif isinstance(t, ContinuousTrigger):
-        state.continuousTracker = ContinuousTracker(t)
-    elif isinstance(t, ChordTrigger):
-        state.debouncer = DwellDebouncer(t.dwellMs)
-    return state
+    """Create a BindingState by delegating to the trigger's buildState() method."""
+    bState = binding.trigger.buildState()
+    bState.binding = binding
+    return bState
 
 
 def getPoseForHand(handData, hand):
@@ -680,58 +725,19 @@ class TriggerMatcher:
             and binding.requireRight is None
         )
 
-    def _processBinding(self, state, handData, timestampMs):
-        b = state.binding
-        t = b.trigger
+    def _processBinding(self, bState, handData, timestampMs):
+        b = bState.binding
         conditionsMet = self._checkConditions(b, handData)
         suppress = len(handData) == 2 and self._isSingleHand(b)
 
-        # Continuous triggers must always update the tracker (even when inactive)
-        # so that ContinuousEnd fires correctly on deactivation.
-        if isinstance(t, ContinuousTrigger):
-            result = handData.get(t.hand) or _emptyResult()
-            enabled = conditionsMet and not suppress
-            value, ended = state.continuousTracker.update(
-                result.pose, result.metrics, timestampMs, enabled=enabled
-            )
-            if value is not None:
-                self.publisher.continuousUpdate(b.name, t.hand, value)
-            if ended:
-                self.publisher.continuousEnd(b.name, t.hand)
+        # ContinuousTrigger must always call process() even when inactive so
+        # that ContinuousEnd fires correctly on deactivation; all other types
+        # skip processing when conditions aren't met.
+        if not isinstance(b.trigger, ContinuousTrigger) and not conditionsMet:
             return
 
-        if not conditionsMet:
-            return
-
-        if isinstance(t, PoseTrigger):
-            # Pass None when suppressed so the debouncer timer resets; otherwise
-            # a dwell built up during a chord could fire the moment one hand leaves.
-            pose = None if suppress else getPoseForHand(handData, t.hand)
-            debouncerInput = pose if pose == t.shape else None
-            if state.debouncer.update(debouncerInput):
-                self.publisher.gestureFired(b.name, t.hand)
-
-        elif isinstance(t, SwipeTrigger):
-            if not suppress and getSwipeForHand(handData, t.hand) == t.direction:
-                self.publisher.gestureFired(b.name, t.hand)
-
-        elif isinstance(t, SequenceTrigger):
-            # Pass None when suppressed so in-progress sequences don't advance.
-            pose = None if suppress else getPoseForHand(handData, t.hand)
-            stepsCompleted, done = state.sequenceTracker.update(pose, timestampMs)
-            if stepsCompleted:
-                self.publisher.sequenceProgress(
-                    b.name, t.hand, stepsCompleted, len(t.steps)
-                )
-            if done:
-                self.publisher.gestureFired(b.name, t.hand)
-
-        elif isinstance(t, ChordTrigger):
-            leftResult = handData.get("left") or _emptyResult()
-            rightResult = handData.get("right") or _emptyResult()
-            chordHeld = leftResult.pose == t.left and rightResult.pose == t.right
-            if state.debouncer.update("chord" if chordHeld else None):
-                self.publisher.gestureFired(b.name, "both")
+        b.trigger.process(bState, handData, timestampMs, self.publisher, b.name,
+                          conditionsMet, suppress)
 
 
 # ── D-Bus publisher ────────────────────────────────────────────────────────────
