@@ -30,6 +30,7 @@ if sys.executable != _VENV and os.path.exists(_VENV):
 
 import argparse
 import json
+import math
 import signal
 import subprocess
 import sys
@@ -46,6 +47,7 @@ import mediapipe as mp
 import dbus
 import dbus.service
 import dbus.mainloop.glib
+from gi.repository import GLib
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -192,27 +194,30 @@ class SequenceTrigger:
 @dataclass
 class ContinuousTrigger:
     hand: str
-    metric: str  # "pinch_distance", "hand_height", "hand_x", "finger_spread"
-    activeWhile: (
-        str | None
-    )  # pose name that must be held to activate this trigger; None = no same-hand pose requirement
+    metric: str       # "pinch_distance", "hand_height", "hand_x", "finger_spread"
     valueRange: tuple  # (low, high) raw sensor range to normalise across [0, 1]
+    hysteresis: float = 0.04  # deadzone fraction used by slot mapping (see RegisterSlots)
 
     @classmethod
     def parse(cls, d, defaultDwellMs):
         return cls(hand=d.get("hand", "right"), metric=d["metric"],
-                   activeWhile=d.get("active_while"),
-                   valueRange=parseRange(d["range"]) if "range" in d else (0.0, 1.0))
+                   valueRange=parseRange(d["range"]) if "range" in d else (0.0, 1.0),
+                   hysteresis=float(d.get("hysteresis", 0.04)))
 
     def buildState(self):
         return BindingState(continuousTracker=ContinuousTracker(self))
 
     def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
         result = handData.get(self.hand) or _emptyResult()
-        value, ended = bState.continuousTracker.update(
-            result.pose, result.metrics, timestampMs, enabled=condsMet and not suppress)
+        tracker = bState.continuousTracker
+        wasActive = tracker.active
+        value, ended = tracker.update(
+            result.metrics, timestampMs, enabled=condsMet and not suppress)
+        if not wasActive and tracker.active:
+            publisher.continuousStart(name, self.hand)
+            publisher.awaitSlotConfig(name, timeoutMs=50)
         if value is not None:
-            publisher.continuousUpdate(name, self.hand, value)
+            publisher.continuousUpdate(name, self.hand, publisher.applySlotConfig(name, tracker, value))
         if ended:
             publisher.continuousEnd(name, self.hand)
 
@@ -253,12 +258,7 @@ class PoseDefinition:
 class Binding:
     name: str
     trigger: object  # one of the trigger types above
-    requireLeft: str | None = (
-        None  # left hand must hold this pose (cross-hand condition)
-    )
-    requireRight: str | None = (
-        None  # right hand must hold this pose (cross-hand condition)
-    )
+    requirePoses: list = None  # [{hand: str, pose: str}, ...]; hand may be "left", "right", or "either"
 
 
 # ── Config loading ─────────────────────────────────────────────────────────────
@@ -310,8 +310,7 @@ def loadConfig(path):
         Binding(
             name=item["name"],
             trigger=parseTrigger(item["trigger"], defaultDwellMs),
-            requireLeft=item.get("require_left"),
-            requireRight=item.get("require_right"),
+            requirePoses=item.get("require", []),
         )
         for item in raw.get("bindings", [])
     ]
@@ -611,7 +610,7 @@ class SequenceTracker:
 
 
 class ContinuousTracker:
-    """Tracks a ContinuousTrigger: active while activeWhile pose is held.
+    """Tracks a ContinuousTrigger: active while binding conditions are met.
 
     Returns (normalizedValue, justEnded) each frame.
     normalizedValue is None when the trigger is inactive.
@@ -621,15 +620,15 @@ class ContinuousTracker:
     def __init__(self, trigger):
         self.trigger = trigger
         self.active = False
+        self.currentSlot = None  # set by applySlotConfig when in slotted mode
 
-    def update(self, pose, metrics, timestampMs, enabled=True):
-        shouldBeActive = enabled and (
-            self.trigger.activeWhile is None or pose == self.trigger.activeWhile
-        )
+    def update(self, metrics, timestampMs, enabled=True):
+        shouldBeActive = enabled
 
         # Deactivation: emit one ContinuousEnd then go idle
         if self.active and not shouldBeActive:
             self.active = False
+            self.currentSlot = None
             return None, True
 
         if shouldBeActive:
@@ -698,31 +697,34 @@ class TriggerMatcher:
             self._processBinding(state, handData, timestampMs)
 
     def _checkConditions(self, binding, handData):
-        """Return True if all require_left / require_right constraints are met."""
-        if binding.requireLeft is not None:
-            leftPose = (handData.get("left") or _emptyResult()).pose
-            if leftPose != binding.requireLeft:
-                return False
-        if binding.requireRight is not None:
-            rightPose = (handData.get("right") or _emptyResult()).pose
-            if rightPose != binding.requireRight:
-                return False
+        """Return True if all require conditions are met."""
+        for req in (binding.requirePoses or []):
+            hand = req["hand"]
+            pose = req["pose"]
+            if hand == "either":
+                leftPose  = (handData.get("left")  or _emptyResult()).pose
+                rightPose = (handData.get("right") or _emptyResult()).pose
+                if leftPose != pose and rightPose != pose:
+                    return False
+            else:
+                actual = (handData.get(hand) or _emptyResult()).pose
+                if actual != pose:
+                    return False
         return True
 
     def _isSingleHand(self, binding):
         """True if this binding should be suppressed when both hands are visible.
 
-        ChordTrigger is inherently two-handed. Bindings with requireLeft /
-        requireRight are deliberately conditioned on both hands. SequenceTrigger
-        requires deliberate ordered steps and must not be suppressed — doing so
-        would prevent any sequence from firing when both hands are in frame.
+        ChordTrigger is inherently two-handed. Bindings with requirePoses are
+        deliberately conditioned on specific hand poses. SequenceTrigger requires
+        deliberate ordered steps and must not be suppressed — doing so would
+        prevent any sequence from firing when both hands are in frame.
         Everything else is a single-hand trigger that should be suppressed while
         both hands are visible, to prevent accidental firing during chord gestures.
         """
         return (
             not isinstance(binding.trigger, (ChordTrigger, SequenceTrigger))
-            and binding.requireLeft is None
-            and binding.requireRight is None
+            and not binding.requirePoses
         )
 
     def _processBinding(self, bState, handData, timestampMs):
@@ -744,17 +746,23 @@ class TriggerMatcher:
 
 
 class GestureEngineService(dbus.service.Object):
-    """D-Bus object that broadcasts gesture signals on the session bus.
+    """D-Bus object that broadcasts gesture signals and receives method calls.
 
-    Method bodies are empty — dbus-python intercepts the decorated call
-    and broadcasts the signal automatically.
+    Signals are emitted synchronously via dbus-python decorators.
+    RegisterSlots is a method that any subscriber can call to configure
+    hysteresis-based slot mapping for a continuous binding.
     """
 
-    def __init__(self, bus):
+    def __init__(self, bus, publisher):
         super().__init__(bus, DBUS_PATH)
+        self._publisher = publisher
 
     @dbus.service.signal(DBUS_IFACE, signature="ss")
     def GestureFired(self, name, hand):
+        pass
+
+    @dbus.service.signal(DBUS_IFACE, signature="ss")
+    def ContinuousStart(self, name, hand):
         pass
 
     @dbus.service.signal(DBUS_IFACE, signature="ssd")
@@ -769,13 +777,31 @@ class GestureEngineService(dbus.service.Object):
     def SequenceProgress(self, name, hand, step, total):
         pass
 
+    @dbus.service.method(DBUS_IFACE, in_signature="si", out_signature="")
+    def RegisterSlots(self, name, slots):
+        """Configure slot-based mapping for a continuous binding.
+
+        Any subscriber can call this via D-Bus to tell the engine to map the
+        raw [0, 1] continuous value to discrete 1..slots indices before emitting
+        ContinuousUpdate. The hysteresis amount is read from the binding's
+        triggers.toml config. Call before or immediately after ContinuousStart;
+        reset is automatic on ContinuousEnd.
+
+        Args:
+            name:  binding name (matches triggers.toml)
+            slots: number of discrete slots (0 = raw passthrough)
+        """
+        self._publisher.registerSlots(str(name), int(slots))
+
 
 class GesturePublisher:
-    """Owns the D-Bus connection and service object.
+    """Owns the D-Bus connection, service object, and slot-mapping state.
 
-    No mainloop is needed: @dbus.service.signal emits synchronously when
-    called, so there's nothing to dispatch. A running mainloop is only
-    required when receiving incoming method calls, which this service never does.
+    Signals are emitted synchronously from the camera loop thread.
+    RegisterSlots method calls arrive on the GLib mainloop thread and update
+    _slotRegistry; awaitSlotConfig blocks the camera loop briefly on gesture
+    start so the subscriber's RegisterSlots call can arrive before the first
+    ContinuousUpdate is emitted.
     """
 
     def __init__(self):
@@ -783,11 +809,68 @@ class GesturePublisher:
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         bus = dbus.SessionBus()
         bus.request_name(DBUS_NAME)
-        self._service = GestureEngineService(bus)
+        self._slotRegistry = {}   # name -> slots: int
+        self._slotEvents   = {}   # name -> threading.Event, used by awaitSlotConfig
+        self._service = GestureEngineService(bus, self)
+        # GLib mainloop runs on a daemon thread so incoming method calls
+        # (RegisterSlots) are dispatched while the camera loop runs.
+        self._gloop = GLib.MainLoop()
+        threading.Thread(target=self._gloop.run, daemon=True).start()
+
+    def registerSlots(self, name, slots):
+        """Called by GestureEngineService.RegisterSlots on the GLib thread."""
+        self._slotRegistry[name] = slots
+        event = self._slotEvents.get(name)
+        if event:
+            event.set()
+        print(f"[slots]  RegisterSlots       {name}  slots={slots}")
+
+    def awaitSlotConfig(self, name, timeoutMs=50):
+        """Block until RegisterSlots arrives for `name`, or timeoutMs elapses.
+
+        Called on the camera thread immediately after ContinuousStart so the
+        subscriber has a chance to call RegisterSlots before the first value
+        is emitted. Returns immediately if the binding is already configured
+        (e.g. registered at startup).
+        """
+        if name in self._slotRegistry:
+            return
+        event = threading.Event()
+        self._slotEvents[name] = event
+        event.wait(timeout=timeoutMs / 1000.0)
+        self._slotEvents.pop(name, None)
+
+    def applySlotConfig(self, name, tracker, value):
+        """Map raw [0,1] value to a slot index using hysteresis if configured.
+
+        Slots are set by the subscriber via RegisterSlots. Hysteresis is read
+        from the binding's trigger config (triggers.toml). Mutates
+        tracker.currentSlot to track state across frames. Returns the slot
+        index as a float (1.0..N.0), or the raw value if no slot config is
+        registered for this binding.
+        """
+        slots = self._slotRegistry.get(name)
+        if slots is None or slots <= 0:
+            return value
+        hysteresis = getattr(tracker.trigger, "hysteresis", 0.04)
+        if tracker.currentSlot is None:
+            tracker.currentSlot = max(1, min(slots, math.floor(value * slots) + 1))
+        else:
+            lower = (tracker.currentSlot - 1) / slots - hysteresis
+            upper =  tracker.currentSlot      / slots + hysteresis
+            if value < lower:
+                tracker.currentSlot = max(1, tracker.currentSlot - 1)
+            elif value > upper:
+                tracker.currentSlot = min(slots, tracker.currentSlot + 1)
+        return float(tracker.currentSlot)
 
     def gestureFired(self, name, hand):
         print(f"[signal] GestureFired       {name}  ({hand})")
         self._service.GestureFired(name, hand)
+
+    def continuousStart(self, name, hand):
+        print(f"[signal] ContinuousStart    {name}  ({hand})")
+        self._service.ContinuousStart(name, hand)
 
     def continuousUpdate(self, name, hand, value):
         self._service.ContinuousUpdate(name, hand, float(value))
@@ -801,7 +884,7 @@ class GesturePublisher:
         self._service.SequenceProgress(name, hand, step, total)
 
     def stop(self):
-        pass
+        self._gloop.quit()
 
 
 # ── Debug overlay ──────────────────────────────────────────────────────────────

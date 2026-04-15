@@ -276,10 +276,10 @@ def serializeTriggersTOML(data):
     for binding in data.get("bindings", []):
         lines.append("[[bindings]]")
         lines.append(f'name = "{binding["name"]}"')
-        if binding.get("require_left"):
-            lines.append(f'require_left = "{binding["require_left"]}"')
-        if binding.get("require_right"):
-            lines.append(f'require_right = "{binding["require_right"]}"')
+        reqs = binding.get("require") or []
+        if reqs:
+            parts = ", ".join(f'{{hand = "{r["hand"]}", pose = "{r["pose"]}"}}'  for r in reqs)
+            lines.append(f"require = [{parts}]")
 
         t  = binding["trigger"]
         td = {k: v for k, v in t.items() if v is not None}

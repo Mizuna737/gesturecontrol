@@ -21,6 +21,9 @@ let captureTarget = null;  // function(fingers) or null
 // Mutable step list for the sequence trigger editor
 let editingSteps = [];
 
+// Mutable require-pose list for the trigger editor
+let editingRequire = [];
+
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
@@ -560,10 +563,6 @@ const TRIGGER_TYPES = [
               ${METRICS.map(m => `<option value="${m}" ${m === trig.metric ? "selected" : ""}>${m}</option>`).join("")}
             </select>
           </div>
-          <div class="field">
-            <label>Active while (pose)</label>
-            <select id="trig-active-while">${poseOptionsWithNone(trig.active_while || "")}</select>
-          </div>
         </div>
         <div class="field">
           <label>Range <span style="font-weight:400;color:var(--text-muted)">[min, max] raw sensor value</span></label>
@@ -572,17 +571,22 @@ const TRIGGER_TYPES = [
             <span class="range-sep">→</span>
             <input id="trig-range-hi" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
           </div>
+        </div>
+        <div class="field" style="max-width:160px">
+          <label>Hysteresis <span style="font-weight:400;color:var(--text-muted)">slot deadzone</span></label>
+          <input id="trig-hysteresis" type="number" step="0.01" min="0" max="0.5"
+                 placeholder="0.04" value="${trig.hysteresis ?? ""}">
         </div>`;
     },
     readFields() {
-      const metric = document.getElementById("trig-metric").value;
-      const aw     = document.getElementById("trig-active-while").value;
-      const lo     = parseFloat(document.getElementById("trig-range-lo").value);
-      const hi     = parseFloat(document.getElementById("trig-range-hi").value);
+      const metric     = document.getElementById("trig-metric").value;
+      const lo         = parseFloat(document.getElementById("trig-range-lo").value);
+      const hi         = parseFloat(document.getElementById("trig-range-hi").value);
+      const hysteresis = parseFloat(document.getElementById("trig-hysteresis").value);
       return {
         metric,
-        ...(aw ? { active_while: aw } : {}),
         ...(!isNaN(lo) && !isNaN(hi) ? { range: [lo, hi] } : {}),
+        ...(!isNaN(hysteresis) ? { hysteresis } : {}),
       };
     },
     meta(t) { return `continuous  •  ${t.hand || "?"}  •  ${t.metric || "?"}`; },
@@ -689,11 +693,36 @@ const TRIGGER_TYPES = [
   },
 ];
 
+function renderRequire() {
+  const container = document.getElementById("trig-require-list");
+  if (!container) return;
+  if (editingRequire.length === 0) {
+    container.innerHTML = `<div class="step-empty">No conditions — fires regardless of other poses.</div>`;
+    return;
+  }
+  container.innerHTML = editingRequire.map((r, i) => `
+    <div class="step-item">
+      <span class="step-name">${esc(r.hand)} hand: ${esc(r.pose)}</span>
+      <button class="btn-icon del" title="Remove" onclick="removeRequire(${i})">✕</button>
+    </div>`).join("");
+}
+
+function addRequire() {
+  const hand = document.getElementById("trig-req-hand")?.value;
+  const pose = document.getElementById("trig-req-pose")?.value;
+  if (!hand || !pose) return;
+  editingRequire.push({ hand, pose });
+  renderRequire();
+}
+
+function removeRequire(i) {
+  editingRequire.splice(i, 1);
+  renderRequire();
+}
+
 function triggerModalHtml(binding) {
   const name = binding?.name ?? "";
   const trig = binding?.trigger ?? {};
-  const rL   = binding?.require_left  ?? "";
-  const rR   = binding?.require_right ?? "";
   const type = trig.type || "pose";
   const hand = trig.hand || "either";
 
@@ -730,14 +759,17 @@ function triggerModalHtml(binding) {
     ${sections}
     <hr class="divider">
     <div id="trig-cross-hand-row" class="${descriptor?.usesCrossHand ? "" : "hidden"}">
-      <div class="field-row">
-        <div class="field">
-          <label>Require left hand (optional)</label>
-          <select id="trig-req-left">${poseOptionsWithNone(rL)}</select>
-        </div>
-        <div class="field">
-          <label>Require right hand (optional)</label>
-          <select id="trig-req-right">${poseOptionsWithNone(rR)}</select>
+      <div class="field">
+        <label>Required poses (optional) <span style="font-weight:400;color:var(--text-muted)">— all must be held</span></label>
+        <div id="trig-require-list"></div>
+        <div class="step-add-row">
+          <select id="trig-req-hand">
+            <option value="either">Either</option>
+            <option value="left">Left</option>
+            <option value="right">Right</option>
+          </select>
+          <select id="trig-req-pose">${poseOptions("")}</select>
+          <button class="btn-secondary" style="white-space:nowrap" onclick="addRequire()">+ Add</button>
         </div>
       </div>
     </div>`;
@@ -751,6 +783,7 @@ function onTriggerTypeChange(type) {
   document.getElementById("trig-hand-field")?.classList.toggle("hidden",     !descriptor?.usesHand);
   document.getElementById("trig-cross-hand-row")?.classList.toggle("hidden", !descriptor?.usesCrossHand);
   descriptor?.onShow?.();
+  renderRequire();
 }
 
 // ── Sequence step management ───────────────────────────────────────────────────
@@ -794,16 +827,21 @@ function moveStep(i, dir) {
 }
 
 function newTrigger() {
-  editingSteps = [];
+  editingSteps   = [];
+  editingRequire = [];
   openModal(triggerModalHtml(null), { type: "trigger", index: -1 });
+  renderRequire();
 }
 
 function editTrigger(i) {
-  const trig       = state.triggers[i]?.trigger ?? {};
+  const binding    = state.triggers[i] ?? {};
+  const trig       = binding.trigger ?? {};
   const descriptor = TRIGGER_TYPES.find(t => t.id === trig.type);
-  editingSteps = trig.type === "sequence" ? [...(trig.steps || [])] : [];
-  openModal(triggerModalHtml(state.triggers[i]), { type: "trigger", index: i });
+  editingSteps   = trig.type === "sequence" ? [...(trig.steps || [])] : [];
+  editingRequire = [...(binding.require || [])];
+  openModal(triggerModalHtml(binding), { type: "trigger", index: i });
   descriptor?.onShow?.();
+  renderRequire();
 }
 
 function deleteTrigger(i, evt) {
@@ -825,14 +863,10 @@ function commitTrigger(index) {
   const trigger = { type, ...typeFields };
   if (descriptor.usesHand) trigger.hand = document.getElementById("trig-hand").value;
 
-  const reqL = descriptor.usesCrossHand ? document.getElementById("trig-req-left")?.value  : "";
-  const reqR = descriptor.usesCrossHand ? document.getElementById("trig-req-right")?.value : "";
-
   const binding = {
     name,
     trigger,
-    ...(reqL ? { require_left: reqL }  : {}),
-    ...(reqR ? { require_right: reqR } : {}),
+    ...(descriptor.usesCrossHand && editingRequire.length ? { require: [...editingRequire] } : {}),
   };
 
   if (index === -1) state.triggers.push(binding);

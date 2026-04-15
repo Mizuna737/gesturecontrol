@@ -77,15 +77,18 @@ pinky = false
 
 [[bindings]]
 name = "tag_cycle"
-trigger = { type = "continuous", hand = "left", metric = "pinch_distance", active_while = "THREE", range = [0.15, 0.3] }
+require = [{hand = "left", pose = "THREE"}]
+trigger = { type = "continuous", hand = "left", metric = "pinch_distance", range = [0.15, 0.3] }
 
 [[bindings]]
 name = "set_volume"
-trigger = { active_while = "L", hand = "left", metric = "pinch_distance", range = [0, 0.6], type = "continuous" }
+require = [{hand = "left", pose = "L"}]
+trigger = { hand = "left", metric = "pinch_distance", range = [0, 0.6], type = "continuous" }
 
 [[bindings]]
 name = "stack_cycle"
-trigger = { type = "continuous", hand = "right", metric = "pinch_distance", active_while = "THREE", range = [0.15, 0.3] }
+require = [{hand = "right", pose = "THREE"}]
+trigger = { type = "continuous", hand = "right", metric = "pinch_distance", range = [0.15, 0.3] }
 
 [[bindings]]
 name = "play_pause"
@@ -94,3 +97,9 @@ trigger = { hand = "left", step_dwell_ms = 5, steps = ["FIVE", "FOUR"], type = "
 [[bindings]]
 name = "browser_back"
 trigger = { type = "swipe", hand = "right", direction = "left", min_displacement = 0.3 }
+
+# Example: require either hand to hold FIST as a modifier for a swipe
+# [[bindings]]
+# name = "mode_switch"
+# require = [{hand = "either", pose = "FIST"}]
+# trigger = { type = "swipe", hand = "right", direction = "left" }
