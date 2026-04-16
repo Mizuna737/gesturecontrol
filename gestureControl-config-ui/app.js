@@ -11,6 +11,7 @@ const state = {
 // Live camera state from SSE
 let liveFingers = { right: null, left: null };  // each: [T,I,M,R,P] or null
 let livePose    = { right: null, left: null };
+let liveSpreads = { right: null, left: null };  // each: {thumbIndex, indexMiddle, middleRing, ringPinky}
 
 // Current modal context
 let modalCtx = null;   // { type, index, data }
@@ -42,6 +43,20 @@ function renderAll() {
   renderPoses();
   renderTriggers();
   renderActions();
+  renderSettings();
+}
+
+function renderSettings() {
+  const dwellEl    = document.getElementById("setting-dwell-ms");
+  const spreadEl   = document.getElementById("setting-spread-threshold");
+  if (dwellEl)  dwellEl.value  = state.settings.dwell_ms          ?? 200;
+  if (spreadEl) spreadEl.value = state.settings.spread_threshold   ?? 0.20;
+}
+
+function onSettingChange(key, value) {
+  if (isNaN(value)) return;
+  state.settings[key] = value;
+  markDirty();
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -142,6 +157,8 @@ function startSSE() {
     liveFingers.left  = hands.left  ? hands.left.fingers  : null;
     livePose.right    = hands.right ? hands.right.pose    : null;
     livePose.left     = hands.left  ? hands.left.pose     : null;
+    liveSpreads.right = hands.right ? hands.right.spreads : null;
+    liveSpreads.left  = hands.left  ? hands.left.spreads  : null;
 
     updateFingerDisplay("right", liveFingers.right, livePose.right);
     updateFingerDisplay("left",  liveFingers.left,  livePose.left);
@@ -168,13 +185,14 @@ function startSSE() {
     }
 
     // Otherwise find a matching pose or create a new one
-    const matchIndex = state.poses.findIndex(p => poseMatchesFingers(p, fingers));
+    const spreads = liveSpreads.right || liveSpreads.left || null;
+    const matchIndex = state.poses.findIndex(p => poseMatchesState(p, fingers, spreads));
     if (matchIndex !== -1) {
       switchTab("poses");
       editPose(matchIndex);
     } else {
       switchTab("poses");
-      captureNewPose(fingers);
+      captureNewPose(fingers, spreads);
     }
   });
 }
@@ -325,11 +343,20 @@ function renderActions() {
 function fingerDots(pose) {
   const fingers = ["thumb","index","middle","ring","pinky"];
   const labels  = ["T","I","M","R","P"];
-  return fingers.map((f, i) => {
+  const dots = fingers.map((f, i) => {
     const val = pose[f];
     const cls = val === true ? "on" : val === false ? "off" : "";
     return `<div class="item-finger ${cls}">${labels[i]}</div>`;
   }).join("");
+
+  const spreadDots = SPREAD_PAIRS.map(({ key, label }) => {
+    const val = pose[key];
+    if (!val) return "";
+    const icon = val === "apart" ? "◀  ▶" : "◀▶";
+    return `<div class="item-spread" title="${label}: ${val}">${icon}</div>`;
+  }).join("");
+
+  return dots + (spreadDots ? `<span class="item-spread-sep">|</span>${spreadDots}` : "");
 }
 
 function triggerMeta(t) {
@@ -394,26 +421,51 @@ function updateCaptureRow() {
 // ── Pose editing ──────────────────────────────────────────────────────────────
 
 const FINGER_NAMES  = ["thumb","index","middle","ring","pinky"];
+const FINGER_LABELS = ["Thumb","Index","Middle","Ring","Pinky"];
 
-function poseMatchesFingers(pose, fingers) {
-  return FINGER_NAMES.every((f, i) => {
+// Adjacent finger pairs — config key, display label, live spread key
+const SPREAD_PAIRS = [
+  { key: "spread_thumb_index",  label: "T–I", liveKey: "thumbIndex"  },
+  { key: "spread_index_middle", label: "I–M", liveKey: "indexMiddle" },
+  { key: "spread_middle_ring",  label: "M–R", liveKey: "middleRing"  },
+  { key: "spread_ring_pinky",   label: "R–P", liveKey: "ringPinky"   },
+];
+
+const SPREAD_THRESHOLD = 0.20;  // mirrors DEFAULT_SPREAD_THRESHOLD in engine
+
+function poseMatchesState(pose, fingers, spreads) {
+  const fingerOk = FINGER_NAMES.every((f, i) => {
     const v = pose[f];
     return v === undefined || v === null || v === fingers[i];
   });
+  if (!fingerOk) return false;
+  if (!spreads) return true;
+  return SPREAD_PAIRS.every(({ key, liveKey }) => {
+    const constraint = pose[key];
+    const value = spreads[liveKey] ?? 0;
+    if (constraint === undefined || constraint === null) return true;
+    if (typeof constraint === "number") return value >= constraint;
+    if (constraint === "apart") return value >= SPREAD_THRESHOLD;
+    if (constraint === "close") return value < SPREAD_THRESHOLD;
+    return true;
+  });
 }
 
-function captureNewPose(fingers) {
+function captureNewPose(fingers, spreads) {
   const pose = { name: "" };
   FINGER_NAMES.forEach((f, i) => { pose[f] = fingers[i]; });
+  if (spreads) {
+    SPREAD_PAIRS.forEach(({ key, liveKey }) => {
+      pose[key] = spreads[liveKey] >= SPREAD_THRESHOLD ? "apart" : "close";
+    });
+  }
   openModal(poseModalHtml(pose), { type: "pose", index: -1 }, applyCaptureToPoseEditor);
 }
-const FINGER_LABELS = ["Thumb","Index","Middle","Ring","Pinky"];
-const FINGER_ICONS  = { true: "●", false: "○", null: "–" };
 
-function fingerToggleHtml(id, fingers) {
+function fingerToggleHtml(fingers) {
   return FINGER_NAMES.map((f, i) => {
-    const val = fingers?.[f] ?? null;
-    const st  = val === true ? "true" : val === false ? "false" : "null";
+    const val  = fingers?.[f] ?? null;
+    const st   = val === true ? "true" : val === false ? "false" : "null";
     const icon = val === true ? "●" : val === false ? "○" : "–";
     return `
       <div class="finger-toggle" data-finger="${f}" data-state="${st}"
@@ -424,15 +476,35 @@ function fingerToggleHtml(id, fingers) {
   }).join("");
 }
 
+function spreadToggleHtml(pose) {
+  return SPREAD_PAIRS.map(({ key, label }) => {
+    const val = pose?.[key] ?? null;
+    const st  = val === null ? "null" : String(val);
+    const icon = val === "close" ? "◀▶" : val === "apart" ? "◀  ▶" : "–";
+    return `
+      <div class="spread-toggle" data-spread="${key}" data-state="${st}"
+           onclick="cycleSpreadState(this)" title="Click to cycle: don't care → close → apart">
+        <div class="spread-toggle-btn">${icon}</div>
+        <span>${label}</span>
+      </div>`;
+  }).join("");
+}
+
 function cycleFingerState(el) {
-  const cur = el.dataset.state;
-  const next = cur === "null" ? "true" : cur === "true" ? "false" : "null";
+  const next = el.dataset.state === "null" ? "true" : el.dataset.state === "true" ? "false" : "null";
   el.dataset.state = next;
   el.querySelector(".finger-toggle-btn").textContent =
     next === "true" ? "●" : next === "false" ? "○" : "–";
 }
 
-function applyCaptureToPoseEditor(fingers) {
+function cycleSpreadState(el) {
+  const next = el.dataset.state === "null" ? "close" : el.dataset.state === "close" ? "apart" : "null";
+  el.dataset.state = next;
+  el.querySelector(".spread-toggle-btn").textContent =
+    next === "close" ? "◀▶" : next === "apart" ? "◀  ▶" : "–";
+}
+
+function applyCaptureToPoseEditor(fingers, spreads) {
   FINGER_NAMES.forEach((f, i) => {
     const el = document.querySelector(`.finger-toggle[data-finger="${f}"]`);
     if (!el) return;
@@ -440,6 +512,15 @@ function applyCaptureToPoseEditor(fingers) {
     el.dataset.state = st;
     el.querySelector(".finger-toggle-btn").textContent = fingers[i] ? "●" : "○";
   });
+  if (spreads) {
+    SPREAD_PAIRS.forEach(({ key, liveKey }) => {
+      const el = document.querySelector(`.spread-toggle[data-spread="${key}"]`);
+      if (!el) return;
+      const st = spreads[liveKey] >= SPREAD_THRESHOLD ? "apart" : "close";
+      el.dataset.state = st;
+      el.querySelector(".spread-toggle-btn").textContent = st === "apart" ? "◀  ▶" : "◀▶";
+    });
+  }
 }
 
 function poseModalHtml(pose) {
@@ -453,21 +534,25 @@ function poseModalHtml(pose) {
     </div>
     <div class="field">
       <label>Fingers <span style="font-weight:400;color:var(--text-muted)">— click to cycle on / off / don't care</span></label>
-      <div class="finger-toggle-row">${fingerToggleHtml(null, fingers)}</div>
+      <div class="finger-toggle-row">${fingerToggleHtml(fingers)}</div>
+    </div>
+    <div class="field">
+      <label>Finger spread <span style="font-weight:400;color:var(--text-muted)">— click to cycle don't care / close / apart</span></label>
+      <div class="spread-toggle-row">${spreadToggleHtml(pose)}</div>
     </div>
     <div class="capture-row">
       <div class="capture-live">
         ${["T","I","M","R","P"].map(l => `<div class="finger-dot">${l}</div>`).join("")}
       </div>
       <button class="btn-secondary" style="font-size:12px;padding:5px 12px"
-              onclick="applyCaptureToPoseEditor(window._captureFingers || [])">
+              onclick="applyCaptureToPoseEditor(window._captureFingers || [], window._captureSpreads)">
         Use live pose
       </button>
     </div>`;
 }
 
-function newPose()      { openModal(poseModalHtml(null), { type: "pose", index: -1 }, applyCaptureToPoseEditor); }
-function editPose(i)    { openModal(poseModalHtml(state.poses[i]), { type: "pose", index: i }, applyCaptureToPoseEditor); }
+function newPose()   { openModal(poseModalHtml(null),           { type: "pose", index: -1 }, applyCaptureToPoseEditor); }
+function editPose(i) { openModal(poseModalHtml(state.poses[i]), { type: "pose", index: i  }, applyCaptureToPoseEditor); }
 
 function deletePose(i, evt) {
   evt.stopPropagation();
@@ -488,6 +573,10 @@ function commitPose(index) {
     if (st === "false") pose[f] = false;
     // null = omit
   });
+  document.querySelectorAll(".spread-toggle").forEach(el => {
+    const st = el.dataset.state;
+    if (st !== "null") pose[el.dataset.spread] = st;  // "close" or "apart"
+  });
 
   if (index === -1) state.poses.push(pose);
   else              state.poses[index] = pose;
@@ -497,9 +586,12 @@ function commitPose(index) {
   closeModal();
 }
 
-// Keep live fingers accessible to the "Use live pose" button
+// Keep live state accessible to the "Use live pose" button
 Object.defineProperty(window, "_captureFingers", {
   get: () => liveFingers.right || liveFingers.left || [],
+});
+Object.defineProperty(window, "_captureSpreads", {
+  get: () => liveSpreads.right || liveSpreads.left || null,
 });
 
 

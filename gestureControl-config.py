@@ -79,26 +79,68 @@ class DarkFrameDetector:
 
 # ── Pose helpers ───────────────────────────────────────────────────────────────
 
+DEFAULT_SPREAD_THRESHOLD = 0.20
+
+
 def fingerStates(landmarks, handLabel):
-    lm     = landmarks
-    index  = lm[8].y  < lm[6].y
-    middle = lm[12].y < lm[10].y
-    ring   = lm[16].y < lm[14].y
-    pinky  = lm[20].y < lm[18].y
+    lm      = landmarks
+    index   = lm[8].y  < lm[6].y
+    middle  = lm[12].y < lm[10].y
+    ring    = lm[16].y < lm[14].y
+    pinky   = lm[20].y < lm[18].y
     isRight = handLabel == "Right"
-    thumb  = lm[4].x > lm[3].x if isRight else lm[4].x < lm[3].x
+    thumb   = lm[4].x > lm[3].x if isRight else lm[4].x < lm[3].x
     return [thumb, index, middle, ring, pinky]
 
 
-def classifyPose(landmarks, handLabel, poses):
-    """Match finger states against the pose list; returns first match name or None."""
-    states = fingerStates(landmarks, handLabel)
+def computeFingerSpreads(landmarks):
+    """Normalized tip-to-tip gaps for the four adjacent finger pairs."""
+    def d(a, b):
+        dx = landmarks[a].x - landmarks[b].x
+        dy = landmarks[a].y - landmarks[b].y
+        return (dx * dx + dy * dy) ** 0.5
+
+    refLen = d(0, 9)
+    if refLen < 1e-6:
+        return {"thumbIndex": 0.0, "indexMiddle": 0.0, "middleRing": 0.0, "ringPinky": 0.0}
+    return {
+        "thumbIndex":  d(4,  8)  / refLen,
+        "indexMiddle": d(8,  12) / refLen,
+        "middleRing":  d(12, 16) / refLen,
+        "ringPinky":   d(16, 20) / refLen,
+    }
+
+
+def checkSpreadConstraint(value, constraint, threshold):
+    if constraint is None:
+        return True
+    if isinstance(constraint, float):
+        return value >= constraint
+    if constraint == "apart":
+        return value >= threshold
+    if constraint == "close":
+        return value < threshold
+    return True
+
+
+def classifyPose(landmarks, handLabel, poses, spreadThreshold=DEFAULT_SPREAD_THRESHOLD):
+    """Match finger states and spread constraints; returns first match name or None."""
+    states  = fingerStates(landmarks, handLabel)
+    spreads = computeFingerSpreads(landmarks)
     for pose in poses:
         constraints = [
             pose.get("thumb"), pose.get("index"), pose.get("middle"),
             pose.get("ring"),  pose.get("pinky"),
         ]
-        if all(c is None or c == s for c, s in zip(constraints, states)):
+        if not all(c is None or c == s for c, s in zip(constraints, states)):
+            continue
+        spreadConstraints = [
+            (spreads["thumbIndex"],  pose.get("spread_thumb_index")),
+            (spreads["indexMiddle"], pose.get("spread_index_middle")),
+            (spreads["middleRing"],  pose.get("spread_middle_ring")),
+            (spreads["ringPinky"],   pose.get("spread_ring_pinky")),
+        ]
+        if all(checkSpreadConstraint(v, c, spreadThreshold) for v, c in spreadConstraints):
             return pose["name"]
     return None
 
@@ -147,12 +189,14 @@ def cameraThread(camInput, cfgDir, state, stopEvent):
     """Background thread: reads camera frames, runs MediaPipe, publishes state."""
     triggersPath = Path(cfgDir) / "triggers.toml"
 
-    def loadPoses():
+    def loadPosesAndSettings():
         try:
             with open(triggersPath, "rb") as f:
-                return tomllib.load(f).get("poses", [])
+                cfg = tomllib.load(f)
+            threshold = cfg.get("settings", {}).get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
+            return cfg.get("poses", []), threshold
         except Exception:
-            return []
+            return [], DEFAULT_SPREAD_THRESHOLD
 
     if not MODEL_PATH.exists():
         state.setError(f"Model not found at {MODEL_PATH}\nRun gestureControl-setup.sh first.")
@@ -180,15 +224,15 @@ def cameraThread(camInput, cfgDir, state, stopEvent):
         min_tracking_confidence=0.5,
     )
 
-    darkDetector  = DarkFrameDetector()
-    poses         = loadPoses()
-    nextPoseReload = time.monotonic() + 2.0
+    darkDetector    = DarkFrameDetector()
+    poses, spreadThreshold = loadPosesAndSettings()
+    nextPoseReload  = time.monotonic() + 2.0
 
     with HandLandmarker.create_from_options(options) as landmarker:
         while not stopEvent.is_set():
             now = time.monotonic()
             if now >= nextPoseReload:
-                poses         = loadPoses()
+                poses, spreadThreshold = loadPosesAndSettings()
                 nextPoseReload = now + 2.0
 
             ret, frame = cap.read()
@@ -213,8 +257,9 @@ def cameraThread(camInput, cfgDir, state, stopEvent):
                 side    = "right" if mpLabel == "Left" else "left"
                 lm      = result.hand_landmarks[i]
                 fingers = fingerStates(lm, mpLabel)
-                pose    = classifyPose(lm, mpLabel, poses)
-                hands[side] = {"fingers": fingers, "pose": pose}
+                spreads = computeFingerSpreads(lm)
+                pose    = classifyPose(lm, mpLabel, poses, spreadThreshold)
+                hands[side] = {"fingers": fingers, "spreads": spreads, "pose": pose}
 
                 h, w = frame.shape[:2]
                 pts  = [(int(l.x * w), int(l.y * h)) for l in lm]
@@ -271,6 +316,11 @@ def serializeTriggersTOML(data):
             val = pose.get(finger)
             if val is not None:
                 lines.append(f"{finger} = {_tomlVal(val)}")
+        for spreadKey in ("spread_thumb_index", "spread_index_middle",
+                          "spread_middle_ring", "spread_ring_pinky"):
+            val = pose.get(spreadKey)
+            if val is not None:
+                lines.append(f"{spreadKey} = {_tomlVal(val)}")
         lines.append("")
 
     for binding in data.get("bindings", []):

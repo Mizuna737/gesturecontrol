@@ -247,11 +247,16 @@ class ChordTrigger:
 @dataclass
 class PoseDefinition:
     name: str
-    thumb: bool | None = None  # None = don't care
+    thumb: bool | None = None   # None = don't care
     index: bool | None = None
     middle: bool | None = None
     ring: bool | None = None
     pinky: bool | None = None
+    # Adjacent finger-pair spread constraints: "close", "apart", float threshold, or None
+    spreadThumbIndex: str | float | None = None
+    spreadIndexMiddle: str | float | None = None
+    spreadMiddleRing: str | float | None = None
+    spreadRingPinky: str | float | None = None
 
 
 @dataclass
@@ -288,7 +293,15 @@ def parseTrigger(d, defaultDwellMs):
 
 
 def parsePose(d):
-    """Build a PoseDefinition from a raw config dict. Absent fingers default to None (don't care)."""
+    """Build a PoseDefinition from a raw config dict. Absent fields default to None (don't care)."""
+    def spreadVal(key):
+        v = d.get(key)
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return v  # "close" or "apart"
+
     return PoseDefinition(
         name=d["name"],
         thumb=d.get("thumb"),
@@ -296,6 +309,10 @@ def parsePose(d):
         middle=d.get("middle"),
         ring=d.get("ring"),
         pinky=d.get("pinky"),
+        spreadThumbIndex=spreadVal("spread_thumb_index"),
+        spreadIndexMiddle=spreadVal("spread_index_middle"),
+        spreadMiddleRing=spreadVal("spread_middle_ring"),
+        spreadRingPinky=spreadVal("spread_ring_pinky"),
     )
 
 
@@ -314,10 +331,54 @@ def loadConfig(path):
         )
         for item in raw.get("bindings", [])
     ]
+    # spread_threshold can be tuned in [settings]; defaults to DEFAULT_SPREAD_THRESHOLD
+    settings.setdefault("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
     return settings, poses, bindings
 
 
 # ── Pose detection ─────────────────────────────────────────────────────────────
+
+# Default normalized gap threshold separating "close" from "apart".
+# Gaps are tip-to-tip Euclidean distances divided by wrist→middle-MCP length.
+DEFAULT_SPREAD_THRESHOLD = 0.20
+
+
+def computeFingerSpreads(landmarks):
+    """Return normalized tip-to-tip gaps for the four adjacent finger pairs.
+
+    Gaps are divided by the wrist(0)→middle-MCP(9) reference length so the
+    values are scale-invariant with camera distance.
+    """
+    def d(a, b):
+        dx = landmarks[a].x - landmarks[b].x
+        dy = landmarks[a].y - landmarks[b].y
+        return (dx * dx + dy * dy) ** 0.5
+
+    refLen = d(0, 9)
+    if refLen < 1e-6:
+        return {"thumbIndex": 0.0, "indexMiddle": 0.0, "middleRing": 0.0, "ringPinky": 0.0}
+    return {
+        "thumbIndex":  d(4,  8)  / refLen,
+        "indexMiddle": d(8,  12) / refLen,
+        "middleRing":  d(12, 16) / refLen,
+        "ringPinky":   d(16, 20) / refLen,
+    }
+
+
+def checkSpreadConstraint(value, constraint, threshold):
+    """Return True if value satisfies constraint.
+
+    constraint: None (don't care) | "close" | "apart" | float (custom min gap)
+    """
+    if constraint is None:
+        return True
+    if isinstance(constraint, float):
+        return value >= constraint
+    if constraint == "apart":
+        return value >= threshold
+    if constraint == "close":
+        return value < threshold
+    return True
 
 
 def fingerStates(landmarks, handLabel):
@@ -339,17 +400,27 @@ def fingerStates(landmarks, handLabel):
     return [thumb, index, middle, ring, pinky]
 
 
-def classifyPose(landmarks, handLabel, poses):
-    """Match current finger states against the user-defined pose list.
+def classifyPose(landmarks, handLabel, poses, spreadThreshold=DEFAULT_SPREAD_THRESHOLD):
+    """Match current finger states and spread constraints against the pose list.
 
-    Each pose specifies True/False/None per finger; None means don't care.
+    Each pose specifies True/False/None per finger (None = don't care) plus
+    optional spread constraints ("close"/"apart"/float) for adjacent finger pairs.
     The first pose whose constraints all match is returned.
     Define more specific poses (more constraints) before general ones in config.
     """
-    states = fingerStates(landmarks, handLabel)
+    states  = fingerStates(landmarks, handLabel)
+    spreads = computeFingerSpreads(landmarks)
     for pose in poses:
-        constraints = [pose.thumb, pose.index, pose.middle, pose.ring, pose.pinky]
-        if all(c is None or c == s for c, s in zip(constraints, states)):
+        fingerConstraints = [pose.thumb, pose.index, pose.middle, pose.ring, pose.pinky]
+        if not all(c is None or c == s for c, s in zip(fingerConstraints, states)):
+            continue
+        spreadConstraints = [
+            (spreads["thumbIndex"],  pose.spreadThumbIndex),
+            (spreads["indexMiddle"], pose.spreadIndexMiddle),
+            (spreads["middleRing"],  pose.spreadMiddleRing),
+            (spreads["ringPinky"],   pose.spreadRingPinky),
+        ]
+        if all(checkSpreadConstraint(v, c, spreadThreshold) for v, c in spreadConstraints):
             return pose.name
     return None
 
@@ -514,15 +585,17 @@ class HandFrameResult:
     metrics: dict  # all metric values, always computed
     rawPose: str | None  # pose before motion suppression (debug only)
     isMoving: bool
-    fingers: list | None = None  # [thumb, index, middle, ring, pinky] booleans
+    fingers: list | None = None   # [thumb, index, middle, ring, pinky] booleans
+    spreads: dict | None = None   # normalized adjacent-pair gaps from computeFingerSpreads
 
 
 class HandProcessor:
     """Bundles SwipeDetector, MotionFilter, and pose classification
     for a single hand. Stateful across frames."""
 
-    def __init__(self, poses):
+    def __init__(self, poses, spreadThreshold=DEFAULT_SPREAD_THRESHOLD):
         self.poses = poses
+        self.spreadThreshold = spreadThreshold
         self.swipeDetector = SwipeDetector()
         self.motionFilter = MotionFilter()
 
@@ -530,10 +603,11 @@ class HandProcessor:
         """Process one frame for this hand and return a HandFrameResult."""
         self.motionFilter.update(landmarks[0].x, landmarks[0].y, timestampMs)
         swipe = self.swipeDetector.update(landmarks[8].x, timestampMs)
-        rawPose = classifyPose(landmarks, mpLabel, self.poses)
+        rawPose = classifyPose(landmarks, mpLabel, self.poses, self.spreadThreshold)
         # Suppress static poses while the hand is in motion
         pose = None if self.motionFilter.isMoving() else rawPose
         metrics = measureAllMetrics(landmarks)
+        spreads = computeFingerSpreads(landmarks)
         return HandFrameResult(
             pose=pose,
             swipe=swipe,
@@ -541,6 +615,7 @@ class HandProcessor:
             rawPose=rawPose,
             isMoving=self.motionFilter.isMoving(),
             fingers=fingerStates(landmarks, mpLabel),
+            spreads=spreads,
         )
 
     def reset(self):
@@ -1288,13 +1363,17 @@ def main():
 
     settings, poses, bindings = loadConfig(args.config)
     defaultDwellMs = settings.get("dwell_ms", 200)
+    spreadThreshold = settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
     print(f"Loaded {len(poses)} pose(s), {len(bindings)} binding(s) from {args.config}")
     configWatcher = ConfigWatcher(args.config)
 
     print("[init] connecting to D-Bus...")
     publisher = GesturePublisher()
     print("[init] D-Bus ready")
-    processors = {"right": HandProcessor(poses), "left": HandProcessor(poses)}
+    processors = {
+        "right": HandProcessor(poses, spreadThreshold),
+        "left":  HandProcessor(poses, spreadThreshold),
+    }
     matcher = TriggerMatcher(bindings, publisher, defaultDwellMs)
     darkFrameDetector = DarkFrameDetector()
 
@@ -1326,9 +1405,10 @@ def main():
                     try:
                         settings, poses, bindings = loadConfig(args.config)
                         defaultDwellMs = settings.get("dwell_ms", 200)
+                        spreadThreshold = settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
                         processors = {
-                            "right": HandProcessor(poses),
-                            "left": HandProcessor(poses),
+                            "right": HandProcessor(poses, spreadThreshold),
+                            "left":  HandProcessor(poses, spreadThreshold),
                         }
                         matcher = TriggerMatcher(bindings, publisher, defaultDwellMs)
                         print(

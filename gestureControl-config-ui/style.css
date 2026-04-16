@@ -308,6 +308,14 @@ body {
 }
 .item-finger.on  { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
 .item-finger.off { background: var(--red-dim);    border-color: var(--red);    color: var(--red); }
+.item-spread-sep { color: var(--border); margin: 0 2px; font-size: 10px; }
+.item-spread {
+  font-size: 9px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  letter-spacing: -1px;
+  cursor: default;
+}
 
 .item-actions {
   display: flex;
@@ -417,6 +425,17 @@ body {
 }
 
 /* ── Form elements ── */
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  max-width: 420px;
+  padding: 8px 0;
+}
+.settings-form input[type="number"] {
+  width: 120px;
+}
+
 .field {
   display: flex;
   flex-direction: column;
@@ -505,6 +524,42 @@ body {
 .finger-toggle[data-state="true"]  .finger-toggle-btn { background: var(--accent-dim); border-color: var(--accent); }
 .finger-toggle[data-state="false"] .finger-toggle-btn { background: var(--red-dim);    border-color: var(--red); }
 .finger-toggle[data-state="null"]  .finger-toggle-btn { opacity: 0.45; }
+
+/* ── Spread toggle (3-state: don't care / close / apart) ── */
+.spread-toggle-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.spread-toggle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.spread-toggle span {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+.spread-toggle-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-sm);
+  border: 2px solid var(--border);
+  background: var(--surface2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  letter-spacing: -2px;
+  transition: all 0.15s;
+}
+.spread-toggle[data-state="close"] .spread-toggle-btn { background: var(--accent-dim); border-color: var(--accent); }
+.spread-toggle[data-state="apart"] .spread-toggle-btn { background: color-mix(in srgb, var(--accent) 15%, transparent); border-color: var(--accent); border-style: dashed; }
+.spread-toggle[data-state="null"]  .spread-toggle-btn { opacity: 0.45; }
 
 /* ── Range inputs ── */
 .range-row {
