@@ -218,12 +218,15 @@ class TrayApp:
         self._active  = False
         self._enabled = False
 
+        self._pollThread  = None
+
         self._statusIcon = Gtk.StatusIcon()
         self._statusIcon.set_from_pixbuf(makePixbuf(False))
         self._statusIcon.set_tooltip_text("gestureControl  ○  Stopped")
         self._statusIcon.set_visible(True)
-        self._statusIcon.connect("popup-menu", self._onPopupMenu)
-        self._statusIcon.connect("activate",   self._onActivate)
+        self._statusIcon.connect("popup-menu",       self._onPopupMenu)
+        self._statusIcon.connect("activate",         self._onActivate)
+        self._statusIcon.connect("notify::embedded", self._onEmbedded)
 
     # ── Menu ───────────────────────────────────────────────────────────────────
 
@@ -313,8 +316,17 @@ class TrayApp:
         GLib.idle_add(self._applyStatus, active, enabled)
         return False   # don't repeat (GLib.timeout_add callback)
 
+    def _onEmbedded(self, icon, _param):
+        """Fires when a tray manager claims (or releases) the icon."""
+        if icon.get_property("embedded") and self._pollThread is None:
+            self._refreshStatus()
+            self._pollThread = threading.Thread(target=self._pollWorker, daemon=True)
+            self._pollThread.start()
+
     def _applyStatus(self, active, enabled):
         """Must run on the GTK main thread."""
+        if not self._statusIcon.get_property("embedded"):
+            return False
         self._active  = active
         self._enabled = enabled
         self._statusIcon.set_from_pixbuf(makePixbuf(active))
@@ -332,8 +344,7 @@ class TrayApp:
     # ── Run ────────────────────────────────────────────────────────────────────
 
     def run(self):
-        self._refreshStatus()
-        threading.Thread(target=self._pollWorker, daemon=True).start()
+        # Poll thread is deferred until notify::embedded fires.
         Gtk.main()
 
 
