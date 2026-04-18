@@ -22,6 +22,9 @@ let captureTarget = null;  // function(fingers) or null
 // Mutable step list for the sequence trigger editor
 let editingSteps = [];
 
+// Mutable prefix step list for the sequenced_continuous trigger editor
+let editingPrefixSteps = [];
+
 // Mutable require-pose list for the trigger editor
 let editingRequire = [];
 
@@ -783,6 +786,73 @@ const TRIGGER_TYPES = [
     },
     meta(t) { return `chord  •  L:${t.left || "?"}  +  R:${t.right || "?"}`; },
   },
+  {
+    id: "sequenced_continuous",
+    label: "Sequence → Continuous",
+    sectionId: "trig-seqcont-section",
+    usesHand: true,
+    usesCrossHand: true,
+    onShow() { renderPrefixSteps(); },
+    fieldsHtml(trig) {
+      return `
+        <div class="field">
+          <label>Prefix steps — complete these to start the continuous gesture</label>
+          <div id="trig-prefix-steps-list"></div>
+          <div class="step-add-row">
+            <select id="trig-prefix-step-select">${poseOptions("")}</select>
+            <button class="btn-secondary" style="white-space:nowrap" onclick="addPrefixStep()">+ Add Step</button>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Prefix window (ms) <span style="font-weight:400;color:var(--text-muted)">max time to complete sequence</span></label>
+            <input id="trig-prefix-window-ms" type="number" min="100" step="100" value="${trig.prefix_window_ms ?? 1500}">
+          </div>
+          <div class="field">
+            <label>Prefix step dwell (ms)</label>
+            <input id="trig-prefix-dwell-ms" type="number" min="0" step="10" value="${trig.prefix_dwell_ms ?? 100}">
+          </div>
+        </div>
+        <div class="field">
+          <label>Metric <span style="font-weight:400;color:var(--text-muted)">(continuous phase)</span></label>
+          <select id="trig-metric">
+            ${METRICS.map(m => `<option value="${m}" ${m === trig.metric ? "selected" : ""}>${m}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>Range <span style="font-weight:400;color:var(--text-muted)">[min, max] raw sensor value</span></label>
+          <div class="range-row">
+            <input id="trig-range-lo" type="number" step="0.01" placeholder="0.0" value="${trig.range?.[0] ?? ""}">
+            <span class="range-sep">→</span>
+            <input id="trig-range-hi" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
+          </div>
+        </div>
+        <div class="field" style="max-width:160px">
+          <label>Hysteresis <span style="font-weight:400;color:var(--text-muted)">slot deadzone</span></label>
+          <input id="trig-hysteresis" type="number" step="0.01" min="0" max="0.5"
+                 placeholder="0.04" value="${trig.hysteresis ?? ""}">
+        </div>`;
+    },
+    readFields() {
+      if (editingPrefixSteps.length < 1) { alert("At least one prefix step is required."); return null; }
+      const metric     = document.getElementById("trig-metric").value;
+      const lo         = parseFloat(document.getElementById("trig-range-lo").value);
+      const hi         = parseFloat(document.getElementById("trig-range-hi").value);
+      const hysteresis = parseFloat(document.getElementById("trig-hysteresis").value);
+      return {
+        prefix_steps:     [...editingPrefixSteps],
+        prefix_window_ms: parseInt(document.getElementById("trig-prefix-window-ms").value, 10) || 1500,
+        prefix_dwell_ms:  parseInt(document.getElementById("trig-prefix-dwell-ms").value, 10) || 100,
+        metric,
+        ...(!isNaN(lo) && !isNaN(hi) ? { range: [lo, hi] } : {}),
+        ...(!isNaN(hysteresis) ? { hysteresis } : {}),
+      };
+    },
+    meta(t) {
+      const prefix = (t.prefix_steps || []).join(" → ");
+      return `seq→cont  •  ${t.hand || "?"}  •  [${prefix}] → ${t.metric || "?"}`;
+    },
+  },
 ];
 
 function renderRequire() {
@@ -918,9 +988,48 @@ function moveStep(i, dir) {
   renderSteps();
 }
 
+function renderPrefixSteps() {
+  const container = document.getElementById("trig-prefix-steps-list");
+  if (!container) return;
+  if (editingPrefixSteps.length === 0) {
+    container.innerHTML = `<div class="step-empty">No prefix steps yet — add at least one below.</div>`;
+    return;
+  }
+  container.innerHTML = editingPrefixSteps.map((step, i) => `
+    <div class="step-item">
+      <span class="step-index">${i + 1}</span>
+      <span class="step-name">${esc(step)}</span>
+      <div class="step-btns">
+        <button class="btn-icon" title="Move up"   onclick="movePrefixStep(${i}, -1)" ${i === 0 ? "disabled" : ""}>↑</button>
+        <button class="btn-icon" title="Move down" onclick="movePrefixStep(${i},  1)" ${i === editingPrefixSteps.length - 1 ? "disabled" : ""}>↓</button>
+        <button class="btn-icon del" title="Remove" onclick="removePrefixStep(${i})">✕</button>
+      </div>
+    </div>`).join("");
+}
+
+function addPrefixStep() {
+  const sel = document.getElementById("trig-prefix-step-select");
+  if (!sel?.value) return;
+  editingPrefixSteps.push(sel.value);
+  renderPrefixSteps();
+}
+
+function removePrefixStep(i) {
+  editingPrefixSteps.splice(i, 1);
+  renderPrefixSteps();
+}
+
+function movePrefixStep(i, dir) {
+  const j = i + dir;
+  if (j < 0 || j >= editingPrefixSteps.length) return;
+  [editingPrefixSteps[i], editingPrefixSteps[j]] = [editingPrefixSteps[j], editingPrefixSteps[i]];
+  renderPrefixSteps();
+}
+
 function newTrigger() {
-  editingSteps   = [];
-  editingRequire = [];
+  editingSteps        = [];
+  editingPrefixSteps  = [];
+  editingRequire      = [];
   openModal(triggerModalHtml(null), { type: "trigger", index: -1 });
   renderRequire();
 }
@@ -929,8 +1038,9 @@ function editTrigger(i) {
   const binding    = state.triggers[i] ?? {};
   const trig       = binding.trigger ?? {};
   const descriptor = TRIGGER_TYPES.find(t => t.id === trig.type);
-  editingSteps   = trig.type === "sequence" ? [...(trig.steps || [])] : [];
-  editingRequire = [...(binding.require || [])];
+  editingSteps       = trig.type === "sequence"              ? [...(trig.steps        || [])] : [];
+  editingPrefixSteps = trig.type === "sequenced_continuous" ? [...(trig.prefix_steps || [])] : [];
+  editingRequire     = [...(binding.require || [])];
   openModal(triggerModalHtml(binding), { type: "trigger", index: i });
   descriptor?.onShow?.();
   renderRequire();

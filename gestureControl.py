@@ -245,6 +245,67 @@ class ChordTrigger:
 
 
 @dataclass
+class SequencedContinuousTrigger:
+    """Continuous trigger gated behind a prefix sequence.
+
+    The prefix sequence must complete before the continuous phase activates.
+    When the continuous phase ends (condsMet goes false or hand leaves frame),
+    the prefix resets and must be repeated.
+    """
+    hand: str
+    prefixSteps: list
+    prefixWindowMs: int
+    prefixStepDwellMs: int
+    metric: str
+    valueRange: tuple
+    hysteresis: float = 0.04
+
+    @classmethod
+    def parse(cls, d, defaultDwellMs):
+        return cls(
+            hand=d.get("hand", "right"),
+            prefixSteps=d["prefix_steps"],
+            prefixWindowMs=d.get("prefix_window_ms", 1500),
+            prefixStepDwellMs=d.get("prefix_dwell_ms", defaultDwellMs),
+            metric=d["metric"],
+            valueRange=parseRange(d["range"]) if "range" in d else (0.0, 1.0),
+            hysteresis=float(d.get("hysteresis", 0.04)),
+        )
+
+    def buildState(self):
+        return BindingState(
+            sequenceTracker=SequenceTracker(
+                self.prefixSteps, self.prefixWindowMs, self.prefixStepDwellMs),
+            continuousTracker=ContinuousTracker(self),
+        )
+
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+        if not bState.prefixComplete:
+            pose = None if suppress else getPoseForHand(handData, self.hand)
+            stepsCompleted, done = bState.sequenceTracker.update(pose, timestampMs)
+            if stepsCompleted:
+                publisher.sequenceProgress(name, self.hand, stepsCompleted, len(self.prefixSteps))
+            if done:
+                bState.prefixComplete = True
+            return
+
+        result = handData.get(self.hand) or _emptyResult()
+        tracker = bState.continuousTracker
+        wasActive = tracker.active
+        value, ended = tracker.update(
+            result.metrics, timestampMs, enabled=condsMet and not suppress)
+        if not wasActive and tracker.active:
+            publisher.continuousStart(name, self.hand)
+            publisher.awaitSlotConfig(name, timeoutMs=50)
+        if value is not None:
+            publisher.continuousUpdate(name, self.hand, publisher.applySlotConfig(name, tracker, value))
+        if ended:
+            publisher.continuousEnd(name, self.hand)
+            bState.prefixComplete = False
+            bState.sequenceTracker.reset()
+
+
+@dataclass
 class PoseDefinition:
     name: str
     thumb: bool | None = None   # None = don't care
@@ -275,11 +336,12 @@ def parseRange(raw):
 
 
 _TRIGGER_CLASSES = {
-    "pose":       PoseTrigger,
-    "swipe":      SwipeTrigger,
-    "sequence":   SequenceTrigger,
-    "continuous": ContinuousTrigger,
-    "chord":      ChordTrigger,
+    "pose":                  PoseTrigger,
+    "swipe":                 SwipeTrigger,
+    "sequence":              SequenceTrigger,
+    "continuous":            ContinuousTrigger,
+    "chord":                 ChordTrigger,
+    "sequenced_continuous":  SequencedContinuousTrigger,
 }
 
 
@@ -726,6 +788,7 @@ class BindingState:
     debouncer: object = None  # DwellDebouncer — pose and chord bindings
     sequenceTracker: object = None  # SequenceTracker — sequence bindings
     continuousTracker: object = None  # ContinuousTracker — continuous bindings
+    prefixComplete: bool = False  # SequencedContinuousTrigger: prefix sequence has fired
 
 
 def buildBindingState(binding, defaultDwellMs):
