@@ -1194,12 +1194,13 @@ def buildHandLandmarker():
     return HandLandmarker.create_from_options(options)
 
 
-def openCamera(camInput, width=None, height=None, fps=None, fmt=None):
+def openCamera(camInput, width=None, height=None, fmt=None):
     """Open the camera, apply format settings, and return the VideoCapture object.
 
     fmt: explicit fourcc string (e.g. "MJPG", "YUYV", "GREY"). If omitted,
-    MJPG is only forced when width/height/fps are also set (RGB camera path).
+    MJPG is only forced when width/height are also set (RGB camera path).
     IR cameras that don't support MJPG should leave fmt and resolution unset.
+    Returns None on failure.
     """
     try:
         camIndex = int(camInput)
@@ -1208,11 +1209,11 @@ def openCamera(camInput, width=None, height=None, fps=None, fmt=None):
     cap = cv2.VideoCapture(camIndex, cv2.CAP_V4L2)
     if not cap.isOpened():
         print(f"ERROR: Cannot open camera {camInput!r}", file=sys.stderr)
-        sys.exit(1)
+        return None
     if fmt:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fmt[:4].upper()))
-    elif width or height or fps:
-        # Only force MJPG when resolution/fps settings are being applied.
+    elif width or height:
+        # Only force MJPG when resolution settings are being applied.
         # IR cameras (fixed native format, no resolution overrides) must not
         # have MJPG forced — the set() silently fails and can destabilise the driver.
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -1220,12 +1221,10 @@ def openCamera(camInput, width=None, height=None, fps=None, fmt=None):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     if height:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    if fps:
-        cap.set(cv2.CAP_PROP_FPS, fps)
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"[init] camera {actual_w}x{actual_h} @ {actual_fps:.0f} fps")
+    print(f"[init] camera {actual_w}x{actual_h} @ {actual_fps:.0f} fps (native)")
     return cap
 
 
@@ -1242,18 +1241,12 @@ def buildHandMap(result):
     return handMap
 
 
-def processFrame(frame, landmarker, processors, matcher, timestampMs, darkFrameDetector,
+def processFrame(frame, landmarker, processors, matcher, timestampMs,
                  streamServer=None):
     """Run detection, trigger matching, and optional debug rendering for one frame."""
     frame = cv2.flip(frame, 1)
     if frame.ndim == 2:  # greyscale input (e.g. IR camera)
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-
-    # IR cameras (e.g. BRIO Windows Hello) interleave dark calibration frames.
-    # Ambient IR (e.g. sunlight) raises the dark-frame baseline unpredictably,
-    # so we use an adaptive split on the bimodal brightness distribution.
-    if darkFrameDetector.isDark(frame.mean()):
-        return
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mpImage = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -1446,9 +1439,10 @@ def main():
         camInput,
         width=settings.get("width"),
         height=settings.get("height"),
-        fps=settings.get("fps"),
         fmt=settings.get("format"),
     )
+    if cap is None:
+        sys.exit(1)
     print("[init] camera opened")
 
     streamServer = None if args.no_stream else StreamServer(args.stream_port)
@@ -1463,9 +1457,14 @@ def main():
         with buildHandLandmarker() as landmarker:
             print("[init] model ready — entering loop")
             frameCount = 0
+            _camKeys = {"camera", "width", "height", "format"}
+            inferenceFps = settings.get("fps") or 0
+            inferenceInterval = (1.0 / inferenceFps) if inferenceFps > 0 else 0
+            lastInferenceTime = 0.0
             while not stopFlag.is_set():
                 if configWatcher.pollChanged():
                     try:
+                        prevSettings = settings
                         settings, poses, bindings = loadConfig(args.config)
                         defaultDwellMs = settings.get("dwell_ms", 200)
                         spreadThreshold = settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
@@ -1474,6 +1473,28 @@ def main():
                             "left":  HandProcessor(poses, spreadThreshold),
                         }
                         matcher = TriggerMatcher(bindings, publisher, defaultDwellMs)
+                        inferenceFps = settings.get("fps") or 0
+                        inferenceInterval = (1.0 / inferenceFps) if inferenceFps > 0 else 0
+                        changedCamKeys = {
+                            k for k in _camKeys
+                            if prevSettings.get(k) != settings.get(k)
+                        }
+                        if changedCamKeys:
+                            oldVals = {k: prevSettings.get(k) for k in changedCamKeys}
+                            newVals = {k: settings.get(k) for k in changedCamKeys}
+                            print(f"[config] Camera settings changed {oldVals} → {newVals}, reopening camera")
+                            newCamInput = args.input if args.input is not None else settings.get("camera", 0)
+                            newCap = openCamera(
+                                newCamInput,
+                                width=settings.get("width"),
+                                height=settings.get("height"),
+                                fmt=settings.get("format"),
+                            )
+                            if newCap is not None:
+                                cap.release()
+                                cap = newCap
+                            else:
+                                print("[config] Camera reopen failed — keeping existing capture", file=sys.stderr)
                         print(
                             f"[config] Reloaded: {len(poses)} pose(s), {len(bindings)} binding(s)"
                         )
@@ -1491,9 +1512,14 @@ def main():
                 frameCount += 1
                 if frameCount <= 3:
                     print(f"[init] frame {frameCount} shape={frame.shape}")
-                timestampMs = int(time.monotonic() * 1000)
-                processFrame(frame, landmarker, processors, matcher, timestampMs, darkFrameDetector,
-                             streamServer=streamServer)
+                if darkFrameDetector is not None and darkFrameDetector.isDark(frame.mean()):
+                    continue
+                now = time.monotonic()
+                if inferenceInterval == 0 or (now - lastInferenceTime) >= inferenceInterval:
+                    lastInferenceTime = now
+                    timestampMs = int(now * 1000)
+                    processFrame(frame, landmarker, processors, matcher, timestampMs,
+                                 streamServer=streamServer)
                 if cv2.waitKey(1) & 0xFF == ord("q") and DEBUG:
                     break
     finally:
