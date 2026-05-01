@@ -54,6 +54,7 @@ from gi.repository import GLib
 MODEL_PATH = (
     Path.home() / ".local" / "share" / "gesturecontrol" / "hand_landmarker.task"
 )
+POSE_MODEL_PATH = MODEL_PATH.parent / "pose_landmarker_lite.task"
 DEFAULT_CONFIG = Path.home() / ".config" / "gesturecontrol" / "triggers.toml"
 
 DBUS_NAME = "org.gesturecontrol"
@@ -93,6 +94,8 @@ class DarkFrameDetector:
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+PoseLandmarker = mp.tasks.vision.PoseLandmarker
+PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
 
 # Landmark index pairs for drawing the hand skeleton
@@ -395,7 +398,8 @@ def loadConfig(path):
     ]
     # spread_threshold can be tuned in [settings]; defaults to DEFAULT_SPREAD_THRESHOLD
     settings.setdefault("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
-    return settings, poses, bindings
+    presence = raw.get("presence", {})
+    return settings, poses, bindings, presence
 
 
 # ── Pose detection ─────────────────────────────────────────────────────────────
@@ -1194,6 +1198,26 @@ def buildHandLandmarker():
     return HandLandmarker.create_from_options(options)
 
 
+def buildPoseLandmarker(minConfidence=0.5):
+    if not POSE_MODEL_PATH.exists():
+        print(
+            f"[presence] pose model not found at {POSE_MODEL_PATH} — "
+            "pose detection disabled; download pose_landmarker_lite.task there to enable",
+            file=sys.stderr,
+        )
+        return None
+    options = PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(POSE_MODEL_PATH)),
+        running_mode=VisionRunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=minConfidence,
+        min_pose_presence_confidence=minConfidence,
+        min_tracking_confidence=0.5,
+        output_segmentation_masks=False,
+    )
+    return PoseLandmarker.create_from_options(options)
+
+
 def openCamera(camInput, width=None, height=None, fmt=None):
     """Open the camera, apply format settings, and return the VideoCapture object.
 
@@ -1417,7 +1441,7 @@ def main():
         print("Run gestureControl-setup.sh to download it.", file=sys.stderr)
         sys.exit(1)
 
-    settings, poses, bindings = loadConfig(args.config)
+    settings, poses, bindings, presence = loadConfig(args.config)
     defaultDwellMs = settings.get("dwell_ms", 200)
     spreadThreshold = settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
     print(f"Loaded {len(poses)} pose(s), {len(bindings)} binding(s) from {args.config}")
@@ -1453,76 +1477,153 @@ def main():
     signal.signal(signal.SIGINT, lambda s, f: stopFlag.set())
 
     print("[init] loading MediaPipe model...")
+    landmarker = buildHandLandmarker()
+    poseLandmarker = None
     try:
-        with buildHandLandmarker() as landmarker:
-            print("[init] model ready — entering loop")
-            frameCount = 0
-            _camKeys = {"camera", "width", "height", "format"}
-            inferenceFps = settings.get("fps") or 0
-            inferenceInterval = (1.0 / inferenceFps) if inferenceFps > 0 else 0
-            lastInferenceTime = 0.0
-            while not stopFlag.is_set():
-                if configWatcher.pollChanged():
-                    try:
-                        prevSettings = settings
-                        settings, poses, bindings = loadConfig(args.config)
-                        defaultDwellMs = settings.get("dwell_ms", 200)
-                        spreadThreshold = settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
-                        processors = {
-                            "right": HandProcessor(poses, spreadThreshold),
-                            "left":  HandProcessor(poses, spreadThreshold),
-                        }
-                        matcher = TriggerMatcher(bindings, publisher, defaultDwellMs)
-                        inferenceFps = settings.get("fps") or 0
-                        inferenceInterval = (1.0 / inferenceFps) if inferenceFps > 0 else 0
-                        changedCamKeys = {
-                            k for k in _camKeys
-                            if prevSettings.get(k) != settings.get(k)
-                        }
-                        if changedCamKeys:
-                            oldVals = {k: prevSettings.get(k) for k in changedCamKeys}
-                            newVals = {k: settings.get(k) for k in changedCamKeys}
-                            print(f"[config] Camera settings changed {oldVals} → {newVals}, reopening camera")
-                            newCamInput = args.input if args.input is not None else settings.get("camera", 0)
-                            newCap = openCamera(
-                                newCamInput,
-                                width=settings.get("width"),
-                                height=settings.get("height"),
-                                fmt=settings.get("format"),
-                            )
-                            if newCap is not None:
-                                cap.release()
-                                cap = newCap
-                            else:
-                                print("[config] Camera reopen failed — keeping existing capture", file=sys.stderr)
-                        print(
-                            f"[config] Reloaded: {len(poses)} pose(s), {len(bindings)} binding(s)"
+        print("[init] model ready — entering loop")
+        frameCount = 0
+        _camKeys = {"camera", "width", "height", "format"}
+        inferenceFps = settings.get("fps") or 0
+        inferenceInterval = (1.0 / inferenceFps) if inferenceFps > 0 else 0
+        lastInferenceTime = 0.0
+        presenceEnabled = presence.get("enabled", False)
+        presenceIdleSecs = presence.get("idleSeconds", 300)
+        presenceThreshold = presence.get("motionThreshold", 5.0)
+        presenceCheckHz = presence.get("checkHz", 2)
+        presenceInterval = 1.0 / presenceCheckHz if presenceCheckHz > 0 else 0.5
+        presencePoseDetection = presence.get("poseDetection", False)
+        presencePoseMinConf = presence.get("poseMinConfidence", 0.5)
+        presencePoseCheckMode = presence.get("poseCheckMode", "fallback")
+        presencePauseHands = presence.get("pauseHandsWhenAbsent", True)
+        presenceRef = None
+        presenceLastCheck = 0.0
+        presenceLastActive = time.monotonic()
+        presenceBlanked = False
+        poseLandmarker = buildPoseLandmarker(presencePoseMinConf) if presencePoseDetection else None
+        if presenceEnabled:
+            print(f"[presence] enabled — idle blanks screen after {presenceIdleSecs}s")
+        while not stopFlag.is_set():
+            if configWatcher.pollChanged():
+                try:
+                    prevSettings = settings
+                    settings, poses, bindings, presence = loadConfig(args.config)
+                    defaultDwellMs = settings.get("dwell_ms", 200)
+                    spreadThreshold = settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
+                    processors = {
+                        "right": HandProcessor(poses, spreadThreshold),
+                        "left":  HandProcessor(poses, spreadThreshold),
+                    }
+                    matcher = TriggerMatcher(bindings, publisher, defaultDwellMs)
+                    inferenceFps = settings.get("fps") or 0
+                    inferenceInterval = (1.0 / inferenceFps) if inferenceFps > 0 else 0
+                    presenceEnabled = presence.get("enabled", False)
+                    presenceIdleSecs = presence.get("idleSeconds", 300)
+                    presenceThreshold = presence.get("motionThreshold", 5.0)
+                    presenceCheckHz = presence.get("checkHz", 2)
+                    presenceInterval = 1.0 / presenceCheckHz if presenceCheckHz > 0 else 0.5
+                    newPoseDetection = presence.get("poseDetection", False)
+                    newPoseMinConf = presence.get("poseMinConfidence", 0.5)
+                    presencePoseCheckMode = presence.get("poseCheckMode", "fallback")
+                    presencePauseHands = presence.get("pauseHandsWhenAbsent", True)
+                    if newPoseDetection != presencePoseDetection or newPoseMinConf != presencePoseMinConf:
+                        if poseLandmarker is not None:
+                            poseLandmarker.close()
+                            poseLandmarker = None
+                        if newPoseDetection:
+                            poseLandmarker = buildPoseLandmarker(newPoseMinConf)
+                    presencePoseDetection = newPoseDetection
+                    presencePoseMinConf = newPoseMinConf
+                    changedCamKeys = {
+                        k for k in _camKeys
+                        if prevSettings.get(k) != settings.get(k)
+                    }
+                    if changedCamKeys:
+                        oldVals = {k: prevSettings.get(k) for k in changedCamKeys}
+                        newVals = {k: settings.get(k) for k in changedCamKeys}
+                        print(f"[config] Camera settings changed {oldVals} → {newVals}, reopening camera")
+                        newCamInput = args.input if args.input is not None else settings.get("camera", 0)
+                        newCap = openCamera(
+                            newCamInput,
+                            width=settings.get("width"),
+                            height=settings.get("height"),
+                            fmt=settings.get("format"),
                         )
-                    except Exception as e:
-                        print(
-                            f"[config] Reload failed — keeping old config: {e}",
-                            file=sys.stderr,
-                        )
-                        notifyError("gestureControl config error", str(e))
+                        if newCap is not None:
+                            cap.release()
+                            cap = newCap
+                        else:
+                            print("[config] Camera reopen failed — keeping existing capture", file=sys.stderr)
+                    print(
+                        f"[config] Reloaded: {len(poses)} pose(s), {len(bindings)} binding(s)"
+                    )
+                except Exception as e:
+                    print(
+                        f"[config] Reload failed — keeping old config: {e}",
+                        file=sys.stderr,
+                    )
+                    notifyError("gestureControl config error", str(e))
 
-                ret, frame = cap.read()
-                if not ret:
-                    print("ERROR: Lost camera feed.", file=sys.stderr)
-                    break
-                frameCount += 1
-                if frameCount <= 3:
-                    print(f"[init] frame {frameCount} shape={frame.shape}")
-                if darkFrameDetector is not None and darkFrameDetector.isDark(frame.mean()):
-                    continue
-                now = time.monotonic()
-                if inferenceInterval == 0 or (now - lastInferenceTime) >= inferenceInterval:
+            ret, frame = cap.read()
+            if not ret:
+                print("ERROR: Lost camera feed.", file=sys.stderr)
+                break
+            frameCount += 1
+            if frameCount <= 3:
+                print(f"[init] frame {frameCount} shape={frame.shape}")
+            if darkFrameDetector is not None and darkFrameDetector.isDark(frame.mean()):
+                continue
+            now = time.monotonic()
+            if presenceEnabled and (now - presenceLastCheck) >= presenceInterval:
+                presenceLastCheck = now
+                small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                                   if len(frame.shape) == 3 else frame,
+                                   (64, 64)).astype(float)
+                if presenceRef is None:
+                    presenceRef = small
+                diff = float(abs(small - presenceRef).mean())
+                # slow drift tracker so lighting changes don't trigger motion
+                presenceRef = 0.95 * presenceRef + 0.05 * small
+                motionDetected = diff > presenceThreshold
+
+                if poseLandmarker is not None and (
+                    presencePoseCheckMode == "always" or not motionDetected
+                ):
+                    timestampMs = int(now * 1000)
+                    poseRgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if len(frame.shape) == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+                    poseImg = mp.Image(image_format=mp.ImageFormat.SRGB, data=poseRgb)
+                    poseResult = poseLandmarker.detect_for_video(poseImg, timestampMs)
+                    if poseResult.pose_landmarks:
+                        motionDetected = True
+
+                if motionDetected:
+                    presenceLastActive = now
+                    if presenceBlanked:
+                        subprocess.Popen(["xset", "dpms", "force", "on"])
+                        presenceBlanked = False
+                        if presencePauseHands and landmarker is None:
+                            print("[presence] screen on — rebuilding hand landmarker")
+                            landmarker = buildHandLandmarker()
+                elif not presenceBlanked and (now - presenceLastActive) > presenceIdleSecs:
+                    subprocess.Popen(["xset", "dpms", "force", "off"])
+                    presenceBlanked = True
+                    if presencePauseHands and landmarker is not None:
+                        print("[presence] screen off — releasing hand landmarker")
+                        landmarker.close()
+                        landmarker = None
+
+            if inferenceInterval == 0 or (now - lastInferenceTime) >= inferenceInterval:
+                if landmarker is not None:
                     lastInferenceTime = now
                     timestampMs = int(now * 1000)
                     processFrame(frame, landmarker, processors, matcher, timestampMs,
                                  streamServer=streamServer)
-                if cv2.waitKey(1) & 0xFF == ord("q") and DEBUG:
-                    break
+            if cv2.waitKey(1) & 0xFF == ord("q") and DEBUG:
+                break
     finally:
+        if landmarker is not None:
+            landmarker.close()
+        if poseLandmarker is not None:
+            poseLandmarker.close()
         cap.release()
         publisher.stop()
         if DEBUG:
