@@ -22,10 +22,9 @@ if sys.executable != _VENV and os.path.exists(_VENV):
 
 import argparse
 import subprocess
-import sys
 import time
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import dbus
@@ -40,31 +39,35 @@ DBUS_IFACE = "org.gesturecontrol.Engine"
 
 @dataclass
 class ExecAction:
-    cmd: list           # command + args passed directly to subprocess (no shell)
+    """Execute a command directly via subprocess (no shell)."""
+    cmd: list
 
 @dataclass
 class ExecScaledAction:
-    template: str       # shell string with {value} placeholder, run via shell=True
+    """Render a shell template with {value} placeholder."""
+    template: str
 
 @dataclass
 class KeyAction:
-    key: str            # key name forwarded to xdotool
+    """Synthesize a keypress via xdotool."""
+    key: str
 
 @dataclass
 class ActionBinding:
-    signal: str         # gesture name to listen for
-    action: object      # ExecAction, ExecScaledAction, or KeyAction
-    onEnd:  object = None  # optional action fired on ContinuousEnd for this signal
-    context: str | None = None  # WM_CLASS substring to match; None = always fire
+    """Map a gesture signal to an action with optional context and onEnd handler."""
+    signal: str
+    action: object
+    onEnd: object = None
+    context: str | None = None
 
 # ── Config loading ─────────────────────────────────────────────────────────────
 
 def parseAction(d):
     """Build an action dataclass from a raw config dict."""
     kind = d["type"]
-    if kind == "exec":
+    if kind in ("exec", "exec_cmd"):
         return ExecAction(cmd=d["cmd"])
-    if kind == "exec_scaled":
+    if kind in ("execScaled", "exec_scaled"):
         return ExecScaledAction(template=d["template"])
     if kind == "key":
         return KeyAction(key=d["key"])
@@ -77,7 +80,8 @@ def loadConfig(path):
     bindings = {}
     for item in raw.get("bindings", []):
         action = parseAction(item["action"])
-        onEnd  = parseAction(item["on_end"]) if "on_end" in item else None
+        onEndVal = item.get("onEnd", item.get("on_end"))
+        onEnd = parseAction(onEndVal) if onEndVal else None
         bindings[item["signal"]] = ActionBinding(
             signal=item["signal"],
             action=action,
@@ -159,8 +163,6 @@ def onContinuousEnd(name, hand, bindings):
     dispatchAction(binding.onEnd)
 
 def onSequenceProgress(name, hand, step, total, bindings):
-    # Progress is informational; a separate overlay process can subscribe here.
-    # The companion emits a brief notification so the user can see sequence state.
     stepStr = f"{step}/{total}"
     print(f"[info]   SequenceProgress {name}  {stepStr}  ({hand})")
     subprocess.run(
@@ -184,7 +186,7 @@ def watchConfig(configPath, bindings):
         try:
             mtime = path.stat().st_mtime
         except OSError:
-            return True  # file gone temporarily, keep polling
+            return True
         if mtime == mtimeHolder[0]:
             return True
         mtimeHolder[0] = mtime
@@ -213,9 +215,6 @@ def main():
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SessionBus()
 
-    # Register handlers for each signal type the engine can emit.
-    # Closures capture the bindings dict by reference — watchConfig mutates
-    # it in-place, so reloads are picked up without re-registering handlers.
     bus.add_signal_receiver(
         lambda name, hand: onGestureFired(name, hand, bindings),
         dbus_interface=DBUS_IFACE,

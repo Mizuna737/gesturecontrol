@@ -22,7 +22,7 @@ let captureTarget = null;  // function(fingers) or null
 // Mutable step list for the sequence trigger editor
 let editingSteps = [];
 
-// Mutable prefix step list for the sequenced_continuous trigger editor
+// Mutable prefix step list for the sequencedContinuous trigger editor
 let editingPrefixSteps = [];
 
 // Mutable require-pose list for the trigger editor
@@ -52,8 +52,8 @@ function renderAll() {
 function renderSettings() {
   const dwellEl    = document.getElementById("setting-dwell-ms");
   const spreadEl   = document.getElementById("setting-spread-threshold");
-  if (dwellEl)  dwellEl.value  = state.settings.dwell_ms          ?? 200;
-  if (spreadEl) spreadEl.value = state.settings.spread_threshold   ?? 0.20;
+  if (dwellEl)  dwellEl.value  = state.settings.dwellMs ?? state.settings.dwell_ms ?? 200;
+  if (spreadEl) spreadEl.value = state.settings.spreadThreshold ?? state.settings.spread_threshold ?? 0.20;
 }
 
 function onSettingChange(key, value) {
@@ -428,10 +428,10 @@ const FINGER_LABELS = ["Thumb","Index","Middle","Ring","Pinky"];
 
 // Adjacent finger pairs — config key, display label, live spread key
 const SPREAD_PAIRS = [
-  { key: "spread_thumb_index",  label: "T–I", liveKey: "thumbIndex"  },
-  { key: "spread_index_middle", label: "I–M", liveKey: "indexMiddle" },
-  { key: "spread_middle_ring",  label: "M–R", liveKey: "middleRing"  },
-  { key: "spread_ring_pinky",   label: "R–P", liveKey: "ringPinky"   },
+  { key: "spreadThumbIndex",  label: "T–I", liveKey: "thumbIndex"  },
+  { key: "spreadIndexMiddle", label: "I–M", liveKey: "indexMiddle" },
+  { key: "spreadMiddleRing",  label: "M–R", liveKey: "middleRing"  },
+  { key: "spreadRingPinky",   label: "R–P", liveKey: "ringPinky"   },
 ];
 
 const SPREAD_THRESHOLD = 0.20;  // mirrors DEFAULT_SPREAD_THRESHOLD in engine
@@ -600,7 +600,7 @@ Object.defineProperty(window, "_captureSpreads", {
 
 // ── Trigger editing ───────────────────────────────────────────────────────────
 
-const METRICS = ["pinch_distance","hand_height","hand_x","finger_spread","angle"];
+const METRICS = ["pinchDistance","handHeight","handX","fingerSpread","angle"];
 
 function poseOptions(selected) {
   return state.poses.map(p =>
@@ -631,7 +631,7 @@ const TRIGGER_TYPES = [
           </div>
           <div class="field" style="max-width:110px">
             <label>Dwell (ms)</label>
-            <input id="trig-dwell" type="number" min="0" step="50" value="${trig.dwell_ms ?? ""}">
+            <input id="trig-dwell" type="number" min="0" step="50" value="${trig.dwellMs ?? trig.dwell_ms ?? ""}">
           </div>
         </div>`;
     },
@@ -639,7 +639,7 @@ const TRIGGER_TYPES = [
       const shape = document.getElementById("trig-shape").value;
       if (!shape) { alert("Shape is required."); return null; }
       const dwell = document.getElementById("trig-dwell").value;
-      return { shape, ...(dwell ? { dwell_ms: parseInt(dwell, 10) } : {}) };
+      return { shape, ...(dwell ? { dwellMs: parseInt(dwell, 10) } : {}) };
     },
     meta(t) { return `pose  •  ${t.hand || "?"}  •  ${t.shape || "?"}`; },
   },
@@ -654,7 +654,7 @@ const TRIGGER_TYPES = [
         <div class="field-row">
           <div class="field">
             <label>Metric</label>
-            <select id="trig-metric">
+            <select id="trig-metric-cont">
               ${METRICS.map(m => `<option value="${m}" ${m === trig.metric ? "selected" : ""}>${m}</option>`).join("")}
             </select>
           </div>
@@ -662,22 +662,24 @@ const TRIGGER_TYPES = [
         <div class="field">
           <label>Range <span style="font-weight:400;color:var(--text-muted)">[min, max] raw sensor value</span></label>
           <div class="range-row">
-            <input id="trig-range-lo" type="number" step="0.01" placeholder="0.0" value="${trig.range?.[0] ?? ""}">
+            <input id="trig-range-lo-cont" type="number" step="0.01" placeholder="0.0" value="${trig.range?.[0] ?? ""}">
             <span class="range-sep">→</span>
-            <input id="trig-range-hi" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
+            <input id="trig-range-hi-cont" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
           </div>
         </div>
         <div class="field" style="max-width:160px">
           <label>Hysteresis <span style="font-weight:400;color:var(--text-muted)">slot deadzone</span></label>
-          <input id="trig-hysteresis" type="number" step="0.01" min="0" max="0.5"
+          <input id="trig-hysteresis-cont" type="number" step="0.01" min="0" max="0.5"
                  placeholder="0.04" value="${trig.hysteresis ?? ""}">
         </div>`;
     },
     readFields() {
-      const metric     = document.getElementById("trig-metric").value;
-      const lo         = parseFloat(document.getElementById("trig-range-lo").value);
-      const hi         = parseFloat(document.getElementById("trig-range-hi").value);
-      const hysteresis = parseFloat(document.getElementById("trig-hysteresis").value);
+      const modalBody = document.getElementById("modal-body");
+      const q = (id) => modalBody.querySelector(`#${id}`);
+      const metric     = q("trig-metric-cont").value;
+      const lo         = parseFloat(q("trig-range-lo-cont").value);
+      const hi         = parseFloat(q("trig-range-hi-cont").value);
+      const hysteresis = parseFloat(q("trig-hysteresis-cont").value);
       return {
         metric,
         ...(!isNaN(lo) && !isNaN(hi) ? { range: [lo, hi] } : {}),
@@ -706,11 +708,11 @@ const TRIGGER_TYPES = [
         <div class="field-row">
           <div class="field">
             <label>Window (ms) <span style="font-weight:400;color:var(--text-muted)">max time to complete</span></label>
-            <input id="trig-window-ms" type="number" min="100" step="100" value="${trig.window_ms ?? 1500}">
+            <input id="trig-window-ms" type="number" min="100" step="100" value="${trig.windowMs ?? trig.window_ms ?? 1500}">
           </div>
           <div class="field">
             <label>Step dwell (ms)</label>
-            <input id="trig-step-dwell-ms" type="number" min="0" step="10" value="${trig.step_dwell_ms ?? 100}">
+            <input id="trig-step-dwell-ms" type="number" min="0" step="10" value="${trig.stepDwellMs ?? trig.step_dwell_ms ?? 100}">
           </div>
         </div>`;
     },
@@ -718,8 +720,8 @@ const TRIGGER_TYPES = [
       if (editingSteps.length < 2) { alert("A sequence needs at least two steps."); return null; }
       return {
         steps:         [...editingSteps],
-        window_ms:     parseInt(document.getElementById("trig-window-ms").value, 10)     || 1500,
-        step_dwell_ms: parseInt(document.getElementById("trig-step-dwell-ms").value, 10) || 100,
+        windowMs:     parseInt(document.getElementById("trig-window-ms").value, 10)     || 1500,
+        stepDwellMs: parseInt(document.getElementById("trig-step-dwell-ms").value, 10) || 100,
       };
     },
     meta(t) { return `sequence  •  ${t.hand || "?"}  •  [${(t.steps || []).join(" → ")}]`; },
@@ -743,14 +745,14 @@ const TRIGGER_TYPES = [
           <div class="field" style="max-width:160px">
             <label>Min displacement <span style="font-weight:400;color:var(--text-muted)">0.0–1.0</span></label>
             <input id="trig-swipe-min-disp" type="number" step="0.05" min="0" max="1"
-                   value="${trig.min_displacement ?? 0.3}">
+                   value="${trig.minDisplacement ?? trig.min_displacement ?? 0.3}">
           </div>
         </div>`;
     },
     readFields() {
       const direction = document.getElementById("trig-swipe-direction").value;
       const minDisp   = parseFloat(document.getElementById("trig-swipe-min-disp").value);
-      return { direction, ...(!isNaN(minDisp) ? { min_displacement: minDisp } : {}) };
+      return { direction, ...(!isNaN(minDisp) ? { minDisplacement: minDisp } : {}) };
     },
     meta(t) { return `swipe  •  ${t.hand || "?"}  •  ${t.direction || "?"}`; },
   },
@@ -774,7 +776,7 @@ const TRIGGER_TYPES = [
         </div>
         <div class="field" style="max-width:150px">
           <label>Dwell (ms)</label>
-          <input id="trig-chord-dwell" type="number" min="0" step="50" value="${trig.dwell_ms ?? ""}">
+          <input id="trig-chord-dwell" type="number" min="0" step="50" value="${trig.dwellMs ?? trig.dwell_ms ?? ""}">
         </div>`;
     },
     readFields() {
@@ -782,12 +784,12 @@ const TRIGGER_TYPES = [
       const right = document.getElementById("trig-chord-right").value;
       if (!left || !right) { alert("Both hand poses are required for a chord."); return null; }
       const dwell = document.getElementById("trig-chord-dwell").value;
-      return { left, right, ...(dwell ? { dwell_ms: parseInt(dwell, 10) } : {}) };
+      return { left, right, ...(dwell ? { dwellMs: parseInt(dwell, 10) } : {}) };
     },
     meta(t) { return `chord  •  L:${t.left || "?"}  +  R:${t.right || "?"}`; },
   },
   {
-    id: "sequenced_continuous",
+    id: "sequencedContinuous",
     label: "Sequence → Continuous",
     sectionId: "trig-seqcont-section",
     usesHand: true,
@@ -806,43 +808,45 @@ const TRIGGER_TYPES = [
         <div class="field-row">
           <div class="field">
             <label>Prefix window (ms) <span style="font-weight:400;color:var(--text-muted)">max time to complete sequence</span></label>
-            <input id="trig-prefix-window-ms" type="number" min="100" step="100" value="${trig.prefix_window_ms ?? 1500}">
+            <input id="trig-prefix-window-ms-seq" type="number" min="100" step="100" value="${trig.prefixWindowMs ?? trig.prefix_window_ms ?? 1500}">
           </div>
           <div class="field">
             <label>Prefix step dwell (ms)</label>
-            <input id="trig-prefix-dwell-ms" type="number" min="0" step="10" value="${trig.prefix_dwell_ms ?? 100}">
+            <input id="trig-prefix-dwell-ms-seq" type="number" min="0" step="10" value="${trig.prefixDwellMs ?? trig.prefix_dwell_ms ?? 100}">
           </div>
         </div>
         <div class="field">
           <label>Metric <span style="font-weight:400;color:var(--text-muted)">(continuous phase)</span></label>
-          <select id="trig-metric">
+          <select id="trig-metric-seq">
             ${METRICS.map(m => `<option value="${m}" ${m === trig.metric ? "selected" : ""}>${m}</option>`).join("")}
           </select>
         </div>
         <div class="field">
           <label>Range <span style="font-weight:400;color:var(--text-muted)">[min, max] raw sensor value</span></label>
           <div class="range-row">
-            <input id="trig-range-lo" type="number" step="0.01" placeholder="0.0" value="${trig.range?.[0] ?? ""}">
+            <input id="trig-range-lo-seq" type="number" step="0.01" placeholder="0.0" value="${trig.range?.[0] ?? ""}">
             <span class="range-sep">→</span>
-            <input id="trig-range-hi" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
+            <input id="trig-range-hi-seq" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
           </div>
         </div>
         <div class="field" style="max-width:160px">
           <label>Hysteresis <span style="font-weight:400;color:var(--text-muted)">slot deadzone</span></label>
-          <input id="trig-hysteresis" type="number" step="0.01" min="0" max="0.5"
+          <input id="trig-hysteresis-seq" type="number" step="0.01" min="0" max="0.5"
                  placeholder="0.04" value="${trig.hysteresis ?? ""}">
         </div>`;
     },
     readFields() {
       if (editingPrefixSteps.length < 1) { alert("At least one prefix step is required."); return null; }
-      const metric     = document.getElementById("trig-metric").value;
-      const lo         = parseFloat(document.getElementById("trig-range-lo").value);
-      const hi         = parseFloat(document.getElementById("trig-range-hi").value);
-      const hysteresis = parseFloat(document.getElementById("trig-hysteresis").value);
+      const modalBody = document.getElementById("modal-body");
+      const q = (id) => modalBody.querySelector(`#${id}`);
+      const metric     = q("trig-metric-seq").value;
+      const lo         = parseFloat(q("trig-range-lo-seq").value);
+      const hi         = parseFloat(q("trig-range-hi-seq").value);
+      const hysteresis = parseFloat(q("trig-hysteresis-seq").value);
       return {
-        prefix_steps:     [...editingPrefixSteps],
-        prefix_window_ms: parseInt(document.getElementById("trig-prefix-window-ms").value, 10) || 1500,
-        prefix_dwell_ms:  parseInt(document.getElementById("trig-prefix-dwell-ms").value, 10) || 100,
+        prefixSteps:     [...editingPrefixSteps],
+        prefixWindowMs: parseInt(q("trig-prefix-window-ms-seq").value, 10) || 1500,
+        prefixDwellMs:  parseInt(q("trig-prefix-dwell-ms-seq").value, 10) || 100,
         metric,
         ...(!isNaN(lo) && !isNaN(hi) ? { range: [lo, hi] } : {}),
         ...(!isNaN(hysteresis) ? { hysteresis } : {}),
@@ -1039,7 +1043,7 @@ function editTrigger(i) {
   const trig       = binding.trigger ?? {};
   const descriptor = TRIGGER_TYPES.find(t => t.id === trig.type);
   editingSteps       = trig.type === "sequence"              ? [...(trig.steps        || [])] : [];
-  editingPrefixSteps = trig.type === "sequenced_continuous" ? [...(trig.prefix_steps || [])] : [];
+  editingPrefixSteps = (trig.type === "sequencedContinuous" || trig.type === "sequenced_continuous") ? [...(trig.prefixSteps || trig.prefix_steps || [])] : [];
   editingRequire     = [...(binding.require || [])];
   openModal(triggerModalHtml(binding), { type: "trigger", index: i });
   descriptor?.onShow?.();
@@ -1106,8 +1110,8 @@ const ACTION_TYPES = [
     meta(a) { return `exec  •  ${(a.cmd || []).join(" ")}`; },
   },
   {
-    id: "exec_scaled",
-    label: "exec_scaled — command with {value}",
+    id: "execScaled",
+    label: "execScaled — command with {value}",
     sectionSuffix: "exec-scaled-section",
     fieldsHtml(pfx, act, hidden) {
       return `
@@ -1120,9 +1124,9 @@ const ACTION_TYPES = [
     readFields(pfx) {
       const tmpl = document.getElementById(`${pfx}-template`)?.value.trim();
       if (!tmpl) return null;
-      return { type: "exec_scaled", template: tmpl };
+      return { type: "execScaled", template: tmpl };
     },
-    meta(a) { return `exec_scaled  •  ${a.template || ""}`; },
+    meta(a) { return `execScaled  •  ${a.template || ""}`; },
   },
   {
     id: "key",

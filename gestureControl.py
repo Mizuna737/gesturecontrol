@@ -35,7 +35,6 @@ import signal
 import subprocess
 import sys
 import time
-import collections
 import threading
 import tomllib
 from dataclasses import dataclass
@@ -44,10 +43,268 @@ from pathlib import Path
 
 import cv2
 import mediapipe as mp
+from poseUtils import (
+    HAND_CONNECTIONS,
+    DarkFrameDetector,
+    DEFAULT_SPREAD_THRESHOLD,
+    checkSpreadConstraint,
+    classifyPose,
+    computeFingerSpreads,
+    drawLandmarks,
+    fingerStates,
+)
+import numpy as np
+import onnxruntime as ort
 import dbus
 import dbus.service
 import dbus.mainloop.glib
 from gi.repository import GLib
+
+# ── ONNX session helper ────────────────────────────────────────────────────────
+
+_onnxCudaNotified = False
+
+
+def _createOnnxSession(modelPath, providers=None):
+    """Load an ONNX model, preferring GPU via CUDA. Falls back to CPU gracefully."""
+    if providers is None:
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    try:
+        sess = ort.InferenceSession(str(modelPath), providers=providers)
+    except Exception as e:
+        if "CPUExecutionProvider" in providers:
+            print(
+                f"[gesture] ONNX {Path(modelPath).name}: CUDA unavailable, falling back to CPU — {e}",
+                file=sys.stderr,
+            )
+            sess = ort.InferenceSession(str(modelPath), providers=["CPUExecutionProvider"])
+        else:
+            raise
+    selected = sess.get_providers()[0]
+    print(f"[gesture] ONNX {Path(modelPath).name} loaded via {selected}", file=sys.stderr)
+    return sess
+
+
+# ── ONNX hand-landmark shim ────────────────────────────────────────────────────
+
+@dataclass
+class NormalizedLandmark:
+    x: float
+    y: float
+    z: float
+
+
+class _HandednessEntry:
+    __slots__ = ("categoryName",)
+    def __init__(self, name):
+        self.categoryName = name
+
+
+class _DetectionResult:
+    __slots__ = ("handLandmarks", "handedness")
+    def __init__(self, handLandmarks, handedness):
+        self.handLandmarks = handLandmarks
+        self.handedness = handedness
+
+
+class HandLandmarkerONNX:
+    _PALM_INPUT_SIZE = np.array([192, 192])   # wh — matches model input_1 shape
+    _LANDMARK_INPUT_SIZE = np.array([224, 224])
+    _SCORE_THRESHOLD = 0.5
+    _NMS_THRESHOLD = 0.3
+    _LANDMARK_CONF_THRESHOLD = 0.5
+
+    _ANCHOR_STRIDES = [8, 16]
+    _ANCHOR_COUNTS = [2, 6]
+
+    def __init__(self, palmModelPath, landmarkModelPath):
+        self._palmSess = _createOnnxSession(palmModelPath)
+        self._landmarkSess = _createOnnxSession(landmarkModelPath)
+        self._palmInputName = self._palmSess.get_inputs()[0].name
+        self._landmarkInputName = self._landmarkSess.get_inputs()[0].name
+        # output[0] = box+landmark deltas [1,2016,18], output[1] = scores [1,2016,1]
+        self._palmOutBox = self._palmSess.get_outputs()[0].name
+        self._palmOutScore = self._palmSess.get_outputs()[1].name
+        # output[0]=landmarks[1,63], output[1]=conf[1,1], output[2]=handedness[1,1]
+        self._landOutLm = self._landmarkSess.get_outputs()[0].name
+        self._landOutConf = self._landmarkSess.get_outputs()[1].name
+        self._landOutHand = self._landmarkSess.get_outputs()[2].name
+        self._anchors = self._buildAnchors()
+
+    def _buildAnchors(self):
+        anchors = []
+        inputH, inputW = self._PALM_INPUT_SIZE[1], self._PALM_INPUT_SIZE[0]
+        anchorConfig = [
+            (8,  2),
+            (16, 6),
+        ]
+        for stride, count in anchorConfig:
+            gridH = int(np.ceil(inputH / stride))
+            gridW = int(np.ceil(inputW / stride))
+            for y in range(gridH):
+                for x in range(gridW):
+                    cx = (x + 0.5) / gridW
+                    cy = (y + 0.5) / gridH
+                    for _ in range(count):
+                        anchors.append([cx, cy])
+        return np.array(anchors, dtype=np.float32)
+
+    def _preprocessPalm(self, image):
+        h, w = image.shape[:2]
+        ih, iw = int(self._PALM_INPUT_SIZE[1]), int(self._PALM_INPUT_SIZE[0])
+        ratio = min(iw / w, ih / h)
+        rw, rh = int(w * ratio), int(h * ratio)
+        resized = cv2.resize(image, (rw, rh))
+        padTop = (ih - rh) // 2
+        padLeft = (iw - rw) // 2
+        canvas = np.zeros((ih, iw, 3), dtype=np.float32)
+        canvas[padTop:padTop+rh, padLeft:padLeft+rw] = resized.astype(np.float32) / 255.0
+        blob = canvas[np.newaxis]
+        padBias = np.array([padLeft, padTop], dtype=np.float32)
+        return blob, ratio, padBias, np.array([w, h], dtype=np.float32)
+
+    def _runPalmDetection(self, image):
+        blob, ratio, padBias, origWH = self._preprocessPalm(image)
+        rawBox, rawScore = self._palmSess.run(
+            [self._palmOutBox, self._palmOutScore],
+            {self._palmInputName: blob}
+        )
+        # rawBox: [1,2016,18] — first 4 are cx,cy,w,h deltas; rest are landmark deltas
+        # rawScore: [1,2016,1]
+        boxDelta = rawBox[0, :, :4]       # (2016, 4)
+        landmarkDelta = rawBox[0, :, 4:]  # (2016, 14) → 7 palm landmarks × 2
+        scores = rawScore[0, :, 0].astype(np.float64)
+        scores = 1.0 / (1.0 + np.exp(-scores))
+
+        scale = max(origWH)
+        cxyDelta = boxDelta[:, :2] / self._PALM_INPUT_SIZE
+        whDelta = boxDelta[:, 2:] / self._PALM_INPUT_SIZE
+        xy1 = (cxyDelta - whDelta / 2 + self._anchors) * scale
+        xy2 = (cxyDelta + whDelta / 2 + self._anchors) * scale
+        boxes = np.concatenate([xy1, xy2], axis=1)
+        boxes -= [padBias[0], padBias[1], padBias[0], padBias[1]]
+
+        keepIdx = cv2.dnn.NMSBoxes(
+            boxes.tolist(), scores.tolist(),
+            self._SCORE_THRESHOLD, self._NMS_THRESHOLD, top_k=5
+        )
+        if len(keepIdx) == 0:
+            return np.empty((0, 19))
+        keepIdx = np.array(keepIdx).flatten()
+        selectedScore = scores[keepIdx]
+        selectedBox = boxes[keepIdx]
+        selectedLm = landmarkDelta[keepIdx].reshape(-1, 7, 2)
+        selectedLm = selectedLm / self._PALM_INPUT_SIZE
+        selectedAnchors = self._anchors[keepIdx]
+        for idx, lm in enumerate(selectedLm):
+            lm += selectedAnchors[idx]
+        selectedLm *= scale
+        selectedLm -= padBias
+        return np.c_[selectedBox.reshape(-1, 4), selectedLm.reshape(-1, 14), selectedScore.reshape(-1, 1)]
+
+    def _cropAndPadFromPalm(self, image, palmBbox, forRotation=False):
+        whPalm = palmBbox[1] - palmBbox[0]
+        if forRotation:
+            shiftVec = np.array([0.0, 0.0]) * whPalm
+            enlargeScale = 4.0
+        else:
+            shiftVec = np.array([0.0, -0.4]) * whPalm
+            enlargeScale = 3.0
+        palmBbox = palmBbox + shiftVec
+        centerPalm = np.sum(palmBbox, axis=0) / 2
+        newHalfSize = (palmBbox[1] - palmBbox[0]) * enlargeScale / 2
+        palmBbox = np.array([centerPalm - newHalfSize, centerPalm + newHalfSize]).astype(np.int32)
+        palmBbox[:, 0] = np.clip(palmBbox[:, 0], 0, image.shape[1])
+        palmBbox[:, 1] = np.clip(palmBbox[:, 1], 0, image.shape[0])
+        crop = image[palmBbox[0][1]:palmBbox[1][1], palmBbox[0][0]:palmBbox[1][0], :]
+        if forRotation:
+            sideLen = int(np.linalg.norm(crop.shape[:2]))
+        else:
+            sideLen = max(crop.shape[:2])
+        padH = sideLen - crop.shape[0]
+        padW = sideLen - crop.shape[1]
+        left = padW // 2; top = padH // 2
+        right = padW - left; bottom = padH - top
+        crop = cv2.copyMakeBorder(crop, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        bias = palmBbox[0] - np.array([left, top], dtype=np.int32)
+        return crop, palmBbox, bias
+
+    def _preprocessLandmark(self, image, palm):
+        palmIdxBase = 0
+        palmIdxMiddle = 2
+        padBias = np.array([0, 0], dtype=np.int32)
+        palmBbox = palm[0:4].reshape(2, 2)
+        image, palmBbox, bias = self._cropAndPadFromPalm(image, palmBbox, forRotation=True)
+        padBias += bias
+        palmBbox = palmBbox - padBias
+        palmLandmarks = palm[4:18].reshape(7, 2) - padBias
+        p1 = palmLandmarks[palmIdxBase]
+        p2 = palmLandmarks[palmIdxMiddle]
+        radians = np.pi / 2 - np.arctan2(-(p2[1] - p1[1]), p2[0] - p1[0])
+        radians = radians - 2 * np.pi * np.floor((radians + np.pi) / (2 * np.pi))
+        angle = np.rad2deg(radians)
+        centerPalm = np.sum(palmBbox, axis=0) / 2
+        rotMat = cv2.getRotationMatrix2D(tuple(centerPalm.astype(float)), angle, 1.0)
+        rotatedImage = cv2.warpAffine(image, rotMat, (image.shape[1], image.shape[0]))
+        homoCoord = np.c_[palmLandmarks, np.ones(palmLandmarks.shape[0])]
+        rotatedLm = np.array([homoCoord @ rotMat[0], homoCoord @ rotMat[1]])
+        rotatedBbox = np.array([np.amin(rotatedLm, axis=1), np.amax(rotatedLm, axis=1)])
+        crop, rotatedBbox, _ = self._cropAndPadFromPalm(rotatedImage, rotatedBbox)
+        iw, ih = int(self._LANDMARK_INPUT_SIZE[0]), int(self._LANDMARK_INPUT_SIZE[1])
+        blob = cv2.resize(crop, (iw, ih), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        return blob[np.newaxis], rotatedBbox, angle, rotMat, padBias
+
+    def _runLandmarkRegression(self, image, palm):
+        blob, rotatedBbox, angle, rotMat, padBias = self._preprocessLandmark(image, palm)
+        lmRaw, confRaw, handRaw = self._landmarkSess.run(
+            [self._landOutLm, self._landOutConf, self._landOutHand],
+            {self._landmarkInputName: blob}
+        )
+        conf = float(confRaw[0][0])
+        if conf < self._LANDMARK_CONF_THRESHOLD:
+            return None, None
+        handScore = float(handRaw[0][0])  # >0.5 → right hand in unflipped frame
+        landmarks = lmRaw[0].reshape(21, 3)
+        iw, ih = int(self._LANDMARK_INPUT_SIZE[0]), int(self._LANDMARK_INPUT_SIZE[1])
+        bboxWH = (rotatedBbox[1] - rotatedBbox[0]).astype(float)
+        landmarks[:, 0] = landmarks[:, 0] / iw * bboxWH[0] + rotatedBbox[0][0]
+        landmarks[:, 1] = landmarks[:, 1] / ih * bboxWH[1] + rotatedBbox[0][1]
+        center = np.sum(rotatedBbox, axis=0) / 2
+        invAngle = -angle
+        invMat = cv2.getRotationMatrix2D(tuple(center.astype(float)), invAngle, 1.0)
+        homo = np.c_[landmarks[:, :2], np.ones(21)]
+        derotXY = np.c_[homo @ invMat[0], homo @ invMat[1]]
+        landmarks[:, :2] = derotXY + padBias
+        return landmarks, handScore
+
+    def detect_for_video(self, frameOrMpImage, timestampMs):
+        if hasattr(frameOrMpImage, 'numpy_view'):
+            frame = frameOrMpImage.numpy_view()  # mp.Image → numpy (RGB)
+            # convert back to BGR for consistent processing
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        else:
+            frame = frameOrMpImage  # already numpy BGR
+        h, w = frame.shape[:2]
+        palms = self._runPalmDetection(frame)
+        handLandmarksList = []
+        handednessList = []
+        for palm in palms:
+            landmarks, handScore = self._runLandmarkRegression(frame, palm)
+            if landmarks is None:
+                continue
+            lmList = [
+                NormalizedLandmark(x=float(landmarks[j, 0]) / w,
+                                   y=float(landmarks[j, 1]) / h,
+                                   z=float(landmarks[j, 2]))
+                for j in range(21)
+            ]
+            # handScore from model: >0.5 = right hand (unflipped). After cv2.flip
+            # in processFrame the labels invert, matching MediaPipe convention.
+            handName = "Right" if handScore > 0.5 else "Left"
+            handLandmarksList.append(lmList)
+            handednessList.append([_HandednessEntry(handName)])
+        return _DetectionResult(handLandmarksList, handednessList)
+
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -55,40 +312,12 @@ MODEL_PATH = (
     Path.home() / ".local" / "share" / "gesturecontrol" / "hand_landmarker.task"
 )
 POSE_MODEL_PATH = MODEL_PATH.parent / "pose_landmarker_lite.task"
+PERSON_DETECT_MODEL_PATH = MODEL_PATH.parent / "person_detection_mediapipe_2023mar.onnx"
 DEFAULT_CONFIG = Path.home() / ".config" / "gesturecontrol" / "triggers.toml"
 
 DBUS_NAME = "org.gesturecontrol"
 DBUS_PATH = "/org/gesturecontrol"
 DBUS_IFACE = "org.gesturecontrol.Engine"
-
-# ── Dark-frame detector ────────────────────────────────────────────────────────
-
-class DarkFrameDetector:
-    """Adaptive filter for IR cameras that interleave dark calibration frames.
-
-    IR cameras (e.g. BRIO Windows Hello) alternate between an illuminated frame
-    and a dark calibration frame. Ambient IR (e.g. sunlight) raises the dark
-    frame baseline above any fixed threshold, so we split on the valley between
-    the two brightness clusters instead of a hardcoded number.
-    """
-
-    _WARMUP_THRESHOLD = 20.0  # fallback until the rolling window fills
-    _WINDOW = 30              # frames to keep in the rolling window
-    _MIN_SPREAD = 5.0         # minimum lo/hi spread to trust the split
-    _SPLIT_FRAC = 0.4         # threshold = lo + spread * frac
-
-    def __init__(self):
-        self._recent = collections.deque(maxlen=self._WINDOW)
-
-    def isDark(self, mean):
-        self._recent.append(mean)
-        if len(self._recent) < 10:
-            return mean < self._WARMUP_THRESHOLD
-        lo = min(self._recent)
-        hi = max(self._recent)
-        if hi - lo < self._MIN_SPREAD:
-            return False  # no bimodal split visible; don't filter anything
-        return mean < lo + (hi - lo) * self._SPLIT_FRAC
 
 # MediaPipe Tasks API aliases
 BaseOptions = mp.tasks.BaseOptions
@@ -98,31 +327,6 @@ PoseLandmarker = mp.tasks.vision.PoseLandmarker
 PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
 
-# Landmark index pairs for drawing the hand skeleton
-HAND_CONNECTIONS = [
-    (0, 1),
-    (1, 2),
-    (2, 3),
-    (3, 4),
-    (0, 5),
-    (5, 6),
-    (6, 7),
-    (7, 8),
-    (5, 9),
-    (9, 10),
-    (10, 11),
-    (11, 12),
-    (9, 13),
-    (13, 14),
-    (14, 15),
-    (15, 16),
-    (13, 17),
-    (0, 17),
-    (17, 18),
-    (18, 19),
-    (19, 20),
-]
-
 DEBUG = False
 
 # ── Config dataclasses ─────────────────────────────────────────────────────────
@@ -130,14 +334,14 @@ DEBUG = False
 
 @dataclass
 class PoseTrigger:
-    hand: str  # "right", "left", or "either"
-    shape: str  # pose name, e.g. "ONE", "FIST"
-    dwellMs: int  # ms the pose must be held before firing
+    hand: str
+    shape: str
+    dwellMs: int
 
     @classmethod
     def parse(cls, d, defaultDwellMs):
         return cls(hand=d.get("hand", "right"), shape=d["shape"],
-                   dwellMs=d.get("dwell_ms", defaultDwellMs))
+                   dwellMs=d.get("dwellMs", d.get("dwell_ms", defaultDwellMs)))
 
     def buildState(self):
         return BindingState(debouncer=DwellDebouncer(self.dwellMs))
@@ -151,14 +355,14 @@ class PoseTrigger:
 @dataclass
 class SwipeTrigger:
     hand: str
-    direction: str  # "LEFT_SWIPE" or "RIGHT_SWIPE" (normalised from config)
-    minDisplacement: float  # normalised x displacement required
+    direction: str
+    minDisplacement: float
 
     @classmethod
     def parse(cls, d, defaultDwellMs):
         return cls(hand=d.get("hand", "right"),
                    direction=d["direction"].upper() + "_SWIPE",
-                   minDisplacement=d.get("min_displacement", 0.15))
+                   minDisplacement=d.get("minDisplacement", d.get("min_displacement", 0.15)))
 
     def buildState(self):
         return BindingState()
@@ -171,21 +375,21 @@ class SwipeTrigger:
 @dataclass
 class SequenceTrigger:
     hand: str
-    steps: list  # ordered pose names, e.g. ["FIST", "THUMBS_UP"]
-    windowMs: int  # max ms between first and last step completion
-    stepDwellMs: int  # ms each individual step must be held to register
+    steps: list
+    windowMs: int
+    stepDwellMs: int
 
     @classmethod
     def parse(cls, d, defaultDwellMs):
         return cls(hand=d.get("hand", "right"), steps=d["steps"],
-                   windowMs=d["window_ms"], stepDwellMs=d.get("step_dwell_ms", 100))
+                   windowMs=d.get("windowMs", d.get("window_ms", 3000)),
+                   stepDwellMs=d.get("stepDwellMs", d.get("step_dwell_ms", 100)))
 
     def buildState(self):
         return BindingState(sequenceTracker=SequenceTracker(
             self.steps, self.windowMs, self.stepDwellMs))
 
     def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
-        # Pass None when suppressed so in-progress sequences don't advance.
         pose = None if suppress else getPoseForHand(handData, self.hand)
         stepsCompleted, done = bState.sequenceTracker.update(pose, timestampMs)
         if stepsCompleted:
@@ -197,9 +401,9 @@ class SequenceTrigger:
 @dataclass
 class ContinuousTrigger:
     hand: str
-    metric: str       # "pinch_distance", "hand_height", "hand_x", "finger_spread"
-    valueRange: tuple  # (low, high) raw sensor range to normalise across [0, 1]
-    hysteresis: float = 0.04  # deadzone fraction used by slot mapping (see RegisterSlots)
+    metric: str
+    valueRange: tuple
+    hysteresis: float = 0.04
 
     @classmethod
     def parse(cls, d, defaultDwellMs):
@@ -227,14 +431,14 @@ class ContinuousTrigger:
 
 @dataclass
 class ChordTrigger:
-    left: str  # pose name required on left hand simultaneously
-    right: str  # pose name required on right hand simultaneously
+    left: str
+    right: str
     dwellMs: int
 
     @classmethod
     def parse(cls, d, defaultDwellMs):
         return cls(left=d["left"], right=d["right"],
-                   dwellMs=d.get("dwell_ms", defaultDwellMs))
+                   dwellMs=d.get("dwellMs", d.get("dwell_ms", defaultDwellMs)))
 
     def buildState(self):
         return BindingState(debouncer=DwellDebouncer(self.dwellMs))
@@ -267,9 +471,9 @@ class SequencedContinuousTrigger:
     def parse(cls, d, defaultDwellMs):
         return cls(
             hand=d.get("hand", "right"),
-            prefixSteps=d["prefix_steps"],
-            prefixWindowMs=d.get("prefix_window_ms", 1500),
-            prefixStepDwellMs=d.get("prefix_dwell_ms", defaultDwellMs),
+            prefixSteps=d.get("prefixSteps", d.get("prefix_steps", [])),
+            prefixWindowMs=d.get("prefixWindowMs", d.get("prefix_window_ms", 1500)),
+            prefixStepDwellMs=d.get("prefixDwellMs", d.get("prefix_dwell_ms", defaultDwellMs)),
             metric=d["metric"],
             valueRange=parseRange(d["range"]) if "range" in d else (0.0, 1.0),
             hysteresis=float(d.get("hysteresis", 0.04)),
@@ -292,6 +496,15 @@ class SequencedContinuousTrigger:
                 bState.prefixComplete = True
             return
 
+        lastPose = self.prefixSteps[-1]
+        currentPose = getPoseForHand(handData, self.hand)
+        if currentPose != lastPose:
+            if bState.continuousTracker.active:
+                publisher.continuousEnd(name, self.hand)
+            bState.prefixComplete = False
+            bState.sequenceTracker.reset()
+            return
+
         result = handData.get(self.hand) or _emptyResult()
         tracker = bState.continuousTracker
         wasActive = tracker.active
@@ -311,12 +524,11 @@ class SequencedContinuousTrigger:
 @dataclass
 class PoseDefinition:
     name: str
-    thumb: bool | None = None   # None = don't care
+    thumb: bool | None = None
     index: bool | None = None
     middle: bool | None = None
     ring: bool | None = None
     pinky: bool | None = None
-    # Adjacent finger-pair spread constraints: "close", "apart", float threshold, or None
     spreadThumbIndex: str | float | None = None
     spreadIndexMiddle: str | float | None = None
     spreadMiddleRing: str | float | None = None
@@ -326,8 +538,8 @@ class PoseDefinition:
 @dataclass
 class Binding:
     name: str
-    trigger: object  # one of the trigger types above
-    requirePoses: list = None  # [{hand: str, pose: str}, ...]; hand may be "left", "right", or "either"
+    trigger: object
+    requirePoses: list = None
 
 
 # ── Config loading ─────────────────────────────────────────────────────────────
@@ -344,7 +556,8 @@ _TRIGGER_CLASSES = {
     "sequence":              SequenceTrigger,
     "continuous":            ContinuousTrigger,
     "chord":                 ChordTrigger,
-    "sequenced_continuous":  SequencedContinuousTrigger,
+    "sequencedContinuous":  SequencedContinuousTrigger,
+    "sequenced_continuous": SequencedContinuousTrigger,
 }
 
 
@@ -374,10 +587,10 @@ def parsePose(d):
         middle=d.get("middle"),
         ring=d.get("ring"),
         pinky=d.get("pinky"),
-        spreadThumbIndex=spreadVal("spread_thumb_index"),
-        spreadIndexMiddle=spreadVal("spread_index_middle"),
-        spreadMiddleRing=spreadVal("spread_middle_ring"),
-        spreadRingPinky=spreadVal("spread_ring_pinky"),
+        spreadThumbIndex=spreadVal("spreadThumbIndex"),
+        spreadIndexMiddle=spreadVal("spreadIndexMiddle"),
+        spreadMiddleRing=spreadVal("spreadMiddleRing"),
+        spreadRingPinky=spreadVal("spreadRingPinky"),
     )
 
 
@@ -386,7 +599,7 @@ def loadConfig(path):
     with open(path, "rb") as f:
         raw = tomllib.load(f)
     settings = raw.get("settings", {})
-    defaultDwellMs = settings.get("dwell_ms", 200)
+    defaultDwellMs = settings.get("dwellMs", settings.get("dwell_ms", 200))
     poses = [parsePose(p) for p in raw.get("poses", [])]
     bindings = [
         Binding(
@@ -396,99 +609,11 @@ def loadConfig(path):
         )
         for item in raw.get("bindings", [])
     ]
-    # spread_threshold can be tuned in [settings]; defaults to DEFAULT_SPREAD_THRESHOLD
-    settings.setdefault("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
+    # spreadThreshold can be tuned in [settings]; defaults to DEFAULT_SPREAD_THRESHOLD
+    spreadThresholdVal = settings.get("spreadThreshold", settings.get("spread_threshold", None))
+    settings.setdefault("spreadThreshold", spreadThresholdVal or DEFAULT_SPREAD_THRESHOLD)
     presence = raw.get("presence", {})
     return settings, poses, bindings, presence
-
-
-# ── Pose detection ─────────────────────────────────────────────────────────────
-
-# Default normalized gap threshold separating "close" from "apart".
-# Gaps are tip-to-tip Euclidean distances divided by wrist→middle-MCP length.
-DEFAULT_SPREAD_THRESHOLD = 0.20
-
-
-def computeFingerSpreads(landmarks):
-    """Return normalized tip-to-tip gaps for the four adjacent finger pairs.
-
-    Gaps are divided by the wrist(0)→middle-MCP(9) reference length so the
-    values are scale-invariant with camera distance.
-    """
-    def d(a, b):
-        dx = landmarks[a].x - landmarks[b].x
-        dy = landmarks[a].y - landmarks[b].y
-        return (dx * dx + dy * dy) ** 0.5
-
-    refLen = d(0, 9)
-    if refLen < 1e-6:
-        return {"thumbIndex": 0.0, "indexMiddle": 0.0, "middleRing": 0.0, "ringPinky": 0.0}
-    return {
-        "thumbIndex":  d(4,  8)  / refLen,
-        "indexMiddle": d(8,  12) / refLen,
-        "middleRing":  d(12, 16) / refLen,
-        "ringPinky":   d(16, 20) / refLen,
-    }
-
-
-def checkSpreadConstraint(value, constraint, threshold):
-    """Return True if value satisfies constraint.
-
-    constraint: None (don't care) | "close" | "apart" | float (custom min gap)
-    """
-    if constraint is None:
-        return True
-    if isinstance(constraint, float):
-        return value >= constraint
-    if constraint == "apart":
-        return value >= threshold
-    if constraint == "close":
-        return value < threshold
-    return True
-
-
-def fingerStates(landmarks, handLabel):
-    """Return [thumb, index, middle, ring, pinky] booleans (True = extended).
-
-    Finger extended: tip.y < pip.y (tip is higher; y increases downward).
-    Thumb: horizontal comparison, direction depends on handedness.
-
-    After cv2.flip(frame, 1), MediaPipe 'Left' == user's right hand,
-    so the thumb direction check is inverted relative to the raw label.
-    """
-    lm = landmarks
-    index = lm[8].y < lm[6].y
-    middle = lm[12].y < lm[10].y
-    ring = lm[16].y < lm[14].y
-    pinky = lm[20].y < lm[18].y
-    isRight = handLabel == "Right"
-    thumb = lm[4].x > lm[3].x if isRight else lm[4].x < lm[3].x
-    return [thumb, index, middle, ring, pinky]
-
-
-def classifyPose(landmarks, handLabel, poses, spreadThreshold=DEFAULT_SPREAD_THRESHOLD):
-    """Match current finger states and spread constraints against the pose list.
-
-    Each pose specifies True/False/None per finger (None = don't care) plus
-    optional spread constraints ("close"/"apart"/float) for adjacent finger pairs.
-    The first pose whose constraints all match is returned.
-    Define more specific poses (more constraints) before general ones in config.
-    """
-    states  = fingerStates(landmarks, handLabel)
-    spreads = computeFingerSpreads(landmarks)
-    for pose in poses:
-        fingerConstraints = [pose.thumb, pose.index, pose.middle, pose.ring, pose.pinky]
-        if not all(c is None or c == s for c, s in zip(fingerConstraints, states)):
-            continue
-        spreadConstraints = [
-            (spreads["thumbIndex"],  pose.spreadThumbIndex),
-            (spreads["indexMiddle"], pose.spreadIndexMiddle),
-            (spreads["middleRing"],  pose.spreadMiddleRing),
-            (spreads["ringPinky"],   pose.spreadRingPinky),
-        ]
-        if all(checkSpreadConstraint(v, c, spreadThreshold) for v, c in spreadConstraints):
-            return pose.name
-    return None
 
 
 # ── Continuous metrics ─────────────────────────────────────────────────────────
@@ -496,22 +621,19 @@ def classifyPose(landmarks, handLabel, poses, spreadThreshold=DEFAULT_SPREAD_THR
 
 def measureMetric(landmarks, metric):
     """Compute a single raw float for a named metric from hand landmarks."""
-    if metric == "pinch_distance":
+    if metric in ("pinchDistance", "pinch_distance"):
         dx = landmarks[4].x - landmarks[8].x
         dy = landmarks[4].y - landmarks[8].y
         return (dx * dx + dy * dy) ** 0.5
-    if metric == "hand_height":
+    if metric in ("handHeight", "hand_height"):
         # Invert y so that raising the hand produces a higher value
         return 1.0 - landmarks[0].y
-    if metric == "hand_x":
+    if metric in ("handX", "hand_x"):
         return landmarks[0].x
-    if metric == "finger_spread":
+    if metric in ("fingerSpread", "finger_spread"):
         xs = [landmarks[i].x for i in [4, 8, 12, 16, 20]]
         return max(xs) - min(xs)
     if metric == "angle":
-        # Vector from wrist (0) to middle-finger MCP (9) gives stable palm direction.
-        # Cosine of that vector w.r.t. horizontal: -1 = pointing left, +1 = pointing right.
-        # Shifted to [0.0, 1.0] so 0 = left, 1 = right.
         dx = landmarks[9].x - landmarks[0].x
         dy = landmarks[9].y - landmarks[0].y
         length = (dx * dx + dy * dy) ** 0.5
@@ -525,7 +647,8 @@ def measureAllMetrics(landmarks):
     """Return a dict of all supported metric values for a hand."""
     return {
         m: measureMetric(landmarks, m)
-        for m in ("pinch_distance", "hand_height", "hand_x", "finger_spread", "angle")
+        for m in ("pinchDistance", "pinch_distance", "handHeight", "hand_height",
+        "handX", "hand_x", "fingerSpread", "finger_spread", "angle")
     }
 
 
@@ -646,13 +769,13 @@ class MotionFilter:
 class HandFrameResult:
     """All processed output for one hand in one frame."""
 
-    pose: str | None  # pose name if static and recognised; None if moving/absent
-    swipe: str | None  # swipe event this frame, or None
-    metrics: dict  # all metric values, always computed
-    rawPose: str | None  # pose before motion suppression (debug only)
+    pose: str | None
+    swipe: str | None
+    metrics: dict
+    rawPose: str | None
     isMoving: bool
-    fingers: list | None = None   # [thumb, index, middle, ring, pinky] booleans
-    spreads: dict | None = None   # normalized adjacent-pair gaps from computeFingerSpreads
+    fingers: list | None = None
+    spreads: dict | None = None
 
 
 class HandProcessor:
@@ -670,7 +793,6 @@ class HandProcessor:
         self.motionFilter.update(landmarks[0].x, landmarks[0].y, timestampMs)
         swipe = self.swipeDetector.update(landmarks[8].x, timestampMs)
         rawPose = classifyPose(landmarks, mpLabel, self.poses, self.spreadThreshold)
-        # Suppress static poses while the hand is in motion
         pose = None if self.motionFilter.isMoving() else rawPose
         metrics = measureAllMetrics(landmarks)
         spreads = computeFingerSpreads(landmarks)
@@ -707,7 +829,7 @@ class SequenceTracker:
         self.stepDwellMs = stepDwellMs
         self.stepDebouncer = DwellDebouncer(stepDwellMs)
         self.currentStep = 0
-        self.firstStepTimeMs = None  # set when step 0 fires; drives timeout
+        self.firstStepTimeMs = None
 
     def update(self, pose, timestampMs):
         """Return (stepsCompleted: int, done: bool).
@@ -716,18 +838,15 @@ class SequenceTracker:
         running count of completed steps (1..N). done is True on the
         frame when the final step completes.
         """
-        # Expire the entire sequence if the window has elapsed since step 0
         if self.firstStepTimeMs is not None:
             if timestampMs - self.firstStepTimeMs > self.windowMs:
                 self.reset()
 
-        # Only feed the expected pose into the debouncer; anything else resets it
         expected = self.steps[self.currentStep]
         debouncerInput = pose if pose == expected else None
         if not self.stepDebouncer.update(debouncerInput):
             return 0, False
 
-        # This step confirmed — record timing and advance
         if self.currentStep == 0:
             self.firstStepTimeMs = timestampMs
         self.currentStep += 1
@@ -737,7 +856,6 @@ class SequenceTracker:
             self.reset()
             return stepsCompleted, True
 
-        # Prepare debouncer for the next step
         self.stepDebouncer.reset()
         return stepsCompleted, False
 
@@ -761,12 +879,11 @@ class ContinuousTracker:
     def __init__(self, trigger):
         self.trigger = trigger
         self.active = False
-        self.currentSlot = None  # set by applySlotConfig when in slotted mode
+        self.currentSlot = None
 
     def update(self, metrics, timestampMs, enabled=True):
         shouldBeActive = enabled
 
-        # Deactivation: emit one ContinuousEnd then go idle
         if self.active and not shouldBeActive:
             self.active = False
             self.currentSlot = None
@@ -788,11 +905,11 @@ class ContinuousTracker:
 class BindingState:
     """Mutable per-binding state initialised at startup."""
 
-    binding: Binding = None  # set by buildBindingState after trigger.buildState()
-    debouncer: object = None  # DwellDebouncer — pose and chord bindings
-    sequenceTracker: object = None  # SequenceTracker — sequence bindings
-    continuousTracker: object = None  # ContinuousTracker — continuous bindings
-    prefixComplete: bool = False  # SequencedContinuousTrigger: prefix sequence has fired
+    binding: Binding = None
+    debouncer: object = None
+    sequenceTracker: object = None
+    continuousTracker: object = None
+    prefixComplete: bool = False
 
 
 def buildBindingState(binding, defaultDwellMs):
@@ -874,9 +991,6 @@ class TriggerMatcher:
         conditionsMet = self._checkConditions(b, handData)
         suppress = len(handData) == 2 and self._isSingleHand(b)
 
-        # ContinuousTrigger must always call process() even when inactive so
-        # that ContinuousEnd fires correctly on deactivation; all other types
-        # skip processing when conditions aren't met.
         if not isinstance(b.trigger, ContinuousTrigger) and not conditionsMet:
             return
 
@@ -947,15 +1061,12 @@ class GesturePublisher:
     """
 
     def __init__(self):
-        # DBusGMainLoop must be set before the first SessionBus() call
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         bus = dbus.SessionBus()
         bus.request_name(DBUS_NAME)
-        self._slotRegistry = {}   # name -> slots: int
-        self._slotEvents   = {}   # name -> threading.Event, used by awaitSlotConfig
+        self._slotRegistry = {}
+        self._slotEvents = {}
         self._service = GestureEngineService(bus, self)
-        # GLib mainloop runs on a daemon thread so incoming method calls
-        # (RegisterSlots) are dispatched while the camera loop runs.
         self._gloop = GLib.MainLoop()
         threading.Thread(target=self._gloop.run, daemon=True).start()
 
@@ -1032,16 +1143,6 @@ class GesturePublisher:
 # ── Debug overlay ──────────────────────────────────────────────────────────────
 
 
-def drawLandmarks(frame, landmarks):
-    """Draw the hand skeleton onto the frame."""
-    h, w = frame.shape[:2]
-    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
-    for a, b in HAND_CONNECTIONS:
-        cv2.line(frame, pts[a], pts[b], (0, 200, 255), 2)
-    for pt in pts:
-        cv2.circle(frame, pt, 5, (255, 255, 255), -1)
-
-
 def renderDebugOverlay(frame, handData):
     """Overlay pose labels and motion indicators for each visible hand."""
     parts = []
@@ -1115,7 +1216,8 @@ def calibrateMetric(metric, camInput, hand="either", countdown=3, sampleSecs=2):
     samples for `sampleSecs` seconds and reports min/avg/max. The average is
     copied to the clipboard so it can be pasted directly into triggers.toml.
     """
-    VALID_METRICS = ("pinch_distance", "hand_height", "hand_x", "finger_spread", "angle")
+    VALID_METRICS = ("pinchDistance", "pinch_distance", "handHeight", "hand_height",
+                     "handX", "hand_x", "fingerSpread", "finger_spread", "angle")
     if metric not in VALID_METRICS:
         print(f"ERROR: unknown metric '{metric}'. Choose from: {', '.join(VALID_METRICS)}", file=sys.stderr)
         sys.exit(1)
@@ -1128,38 +1230,28 @@ def calibrateMetric(metric, camInput, hand="either", countdown=3, sampleSecs=2):
         time.sleep(1.0)
     print("Sampling!", flush=True)
 
-    options = HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
-        running_mode=VisionRunningMode.VIDEO,
-        num_hands=2,
-        min_hand_detection_confidence=0.7,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    landmarker = buildHandLandmarker()
     cap = openCamera(camInput)
     detector = DarkFrameDetector()
     samples = []
     deadline = time.monotonic() + sampleSecs
 
-    with HandLandmarker.create_from_options(options) as landmarker:
-        while time.monotonic() < deadline:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if detector.isDark(frame.mean()):
+    while time.monotonic() < deadline:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if detector.isDark(frame.mean()):
+            continue
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        ts = int(time.monotonic() * 1000)
+        result = landmarker.detect_for_video(frame, ts)
+        for i, handedness in enumerate(result.handedness):
+            mpLabel = handedness[0].categoryName
+            side = "right" if mpLabel == "Left" else "left"
+            if hand != "either" and side != hand:
                 continue
-            if frame.ndim == 2:
-                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mpImage = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            ts = int(time.monotonic() * 1000)
-            result = landmarker.detect_for_video(mpImage, ts)
-            for i, handedness in enumerate(result.handedness):
-                mpLabel = handedness[0].category_name  # "Left" or "Right"
-                side = "right" if mpLabel == "Left" else "left"
-                if hand != "either" and side != hand:
-                    continue
-                samples.append(measureMetric(result.hand_landmarks[i], metric))
+            samples.append(measureMetric(result.handLandmarks[i], metric))
 
     cap.release()
 
@@ -1185,37 +1277,77 @@ def calibrateMetric(metric, camInput, hand="either", countdown=3, sampleSecs=2):
             print("(clipboard copy failed — xclip and wl-copy not found)", file=sys.stderr)
 
 
+class _PoseDetectResult:
+    __slots__ = ("pose_landmarks",)
+    def __init__(self, poseLandmarks):
+        self.pose_landmarks = poseLandmarks
+
+
+class PoseLandmarkerONNX:
+    _CONF_THRESHOLD = 0.5
+
+    def __init__(self, modelPath):
+        self._session = _createOnnxSession(modelPath)
+
+        inputShape = self._session.get_inputs()[0].shape  # [1, 3, H, W]
+        self._inputH = inputShape[2]
+        self._inputW = inputShape[3]
+
+        outputInfo = ", ".join(
+            f"{o.name}{o.shape}" for o in self._session.get_outputs()
+        )
+        print(f"[presence] ONNX outputs: {outputInfo}", file=sys.stderr)
+
+        self._confOutputName = None
+        for out in self._session.get_outputs():
+            if len(out.shape) == 3 and out.shape[2] == 1:
+                self._confOutputName = out.name
+                break
+        if self._confOutputName is None:
+            self._confOutputName = self._session.get_outputs()[0].name
+
+    def detect_for_video(self, frameBgr, timestampMs):
+        resized = cv2.resize(frameBgr, (self._inputW, self._inputH))
+        if len(resized.shape) == 2:
+            resized = cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
+        frameRgb = resized[:, :, ::-1].astype(np.float32) / 255.0
+        inputTensor = np.transpose(frameRgb, (2, 0, 1))[np.newaxis, ...]  # [1,3,H,W]
+
+        outputs = self._session.run([self._confOutputName], {"input_1:0": inputTensor})
+        scores = outputs[0][0, :, 0]  # shape [N]
+        personPresent = bool(np.any(scores > self._CONF_THRESHOLD))
+        return _PoseDetectResult([True] if personPresent else [])
+
+
 def buildHandLandmarker():
-    """Create and return a MediaPipe HandLandmarker in VIDEO mode."""
-    options = HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
-        running_mode=VisionRunningMode.VIDEO,
-        num_hands=2,
-        min_hand_detection_confidence=0.7,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    return HandLandmarker.create_from_options(options)
+    palmModelPath = Path.home() / ".local/share/gesturecontrol/palm_detection_mediapipe.onnx"
+    landmarkModelPath = Path.home() / ".local/share/gesturecontrol/handpose_estimation_mediapipe.onnx"
+    lm = HandLandmarkerONNX(palmModelPath, landmarkModelPath)
+    if "CUDAExecutionProvider" not in lm._palmSess.get_providers():
+        global _onnxCudaNotified
+        if not _onnxCudaNotified:
+            _onnxCudaNotified = True
+            notifyError(
+                "gestureControl",
+                "Hand tracking running on CPU — GPU (CUDA) not available. Performance may be reduced.",
+            )
+    return lm
 
 
 def buildPoseLandmarker(minConfidence=0.5):
-    if not POSE_MODEL_PATH.exists():
-        print(
-            f"[presence] pose model not found at {POSE_MODEL_PATH} — "
-            "pose detection disabled; download pose_landmarker_lite.task there to enable",
-            file=sys.stderr,
-        )
+    if not PERSON_DETECT_MODEL_PATH.exists():
+        print(f"[presence] person detection model not found at {PERSON_DETECT_MODEL_PATH}", file=sys.stderr)
         return None
-    options = PoseLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(POSE_MODEL_PATH)),
-        running_mode=VisionRunningMode.VIDEO,
-        num_poses=1,
-        min_pose_detection_confidence=minConfidence,
-        min_pose_presence_confidence=minConfidence,
-        min_tracking_confidence=0.5,
-        output_segmentation_masks=False,
-    )
-    return PoseLandmarker.create_from_options(options)
+    pm = PoseLandmarkerONNX(PERSON_DETECT_MODEL_PATH)
+    if "CUDAExecutionProvider" not in pm._session.get_providers():
+        global _onnxCudaNotified
+        if not _onnxCudaNotified:
+            _onnxCudaNotified = True
+            notifyError(
+                "gestureControl",
+                "Pose detection running on CPU — GPU (CUDA) not available. Performance may be reduced.",
+            )
+    return pm
 
 
 def openCamera(camInput, width=None, height=None, fmt=None):
@@ -1237,9 +1369,6 @@ def openCamera(camInput, width=None, height=None, fmt=None):
     if fmt:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fmt[:4].upper()))
     elif width or height:
-        # Only force MJPG when resolution settings are being applied.
-        # IR cameras (fixed native format, no resolution overrides) must not
-        # have MJPG forced — the set() silently fails and can destabilise the driver.
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     if width:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -1258,10 +1387,10 @@ def buildHandMap(result):
     After cv2.flip(frame, 1): MediaPipe "Left" label == user's right hand.
     """
     handMap = {}
-    for i in range(len(result.hand_landmarks)):
-        mpLabel = result.handedness[i][0].category_name
+    for i in range(len(result.handLandmarks)):
+        mpLabel = result.handedness[i][0].categoryName
         side = "right" if mpLabel == "Left" else "left"
-        handMap[side] = (result.hand_landmarks[i], mpLabel)
+        handMap[side] = (result.handLandmarks[i], mpLabel)
     return handMap
 
 
@@ -1272,10 +1401,7 @@ def processFrame(frame, landmarker, processors, matcher, timestampMs,
     if frame.ndim == 2:  # greyscale input (e.g. IR camera)
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mpImage = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-    result = landmarker.detect_for_video(mpImage, timestampMs)
+    result = landmarker.detect_for_video(frame, timestampMs)
     handMap = buildHandMap(result)
 
     handData = {}
@@ -1341,7 +1467,7 @@ class StreamServer:
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
-                pass  # suppress per-request output
+                pass
 
             def do_GET(self):
                 if self.path == "/stream":
@@ -1442,8 +1568,8 @@ def main():
         sys.exit(1)
 
     settings, poses, bindings, presence = loadConfig(args.config)
-    defaultDwellMs = settings.get("dwell_ms", 200)
-    spreadThreshold = settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
+    defaultDwellMs = settings.get("dwellMs", settings.get("dwell_ms", 200))
+    spreadThreshold = settings.get("spreadThreshold", settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD))
     print(f"Loaded {len(poses)} pose(s), {len(bindings)} binding(s) from {args.config}")
     configWatcher = ConfigWatcher(args.config)
 
@@ -1471,12 +1597,10 @@ def main():
 
     streamServer = None if args.no_stream else StreamServer(args.stream_port)
 
-    # cap.read() is a blocking C call — Python's KeyboardInterrupt won't fire
-    # until it returns. Use a stop flag set by the signal handler instead.
     stopFlag = threading.Event()
     signal.signal(signal.SIGINT, lambda s, f: stopFlag.set())
 
-    print("[init] loading MediaPipe model...")
+    print("[init] loading hand landmarker model...")
     landmarker = buildHandLandmarker()
     poseLandmarker = None
     try:
@@ -1507,8 +1631,8 @@ def main():
                 try:
                     prevSettings = settings
                     settings, poses, bindings, presence = loadConfig(args.config)
-                    defaultDwellMs = settings.get("dwell_ms", 200)
-                    spreadThreshold = settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
+                    defaultDwellMs = settings.get("dwellMs", settings.get("dwell_ms", 200))
+                    spreadThreshold = settings.get("spreadThreshold", settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD))
                     processors = {
                         "right": HandProcessor(poses, spreadThreshold),
                         "left":  HandProcessor(poses, spreadThreshold),
@@ -1527,7 +1651,6 @@ def main():
                     presencePauseHands = presence.get("pauseHandsWhenAbsent", True)
                     if newPoseDetection != presencePoseDetection or newPoseMinConf != presencePoseMinConf:
                         if poseLandmarker is not None:
-                            poseLandmarker.close()
                             poseLandmarker = None
                         if newPoseDetection:
                             poseLandmarker = buildPoseLandmarker(newPoseMinConf)
@@ -1589,9 +1712,7 @@ def main():
                     presencePoseCheckMode == "always" or not motionDetected
                 ):
                     timestampMs = int(now * 1000)
-                    poseRgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if len(frame.shape) == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-                    poseImg = mp.Image(image_format=mp.ImageFormat.SRGB, data=poseRgb)
-                    poseResult = poseLandmarker.detect_for_video(poseImg, timestampMs)
+                    poseResult = poseLandmarker.detect_for_video(frame, timestampMs)
                     if poseResult.pose_landmarks:
                         motionDetected = True
 
@@ -1608,7 +1729,6 @@ def main():
                     presenceBlanked = True
                     if presencePauseHands and landmarker is not None:
                         print("[presence] screen off — releasing hand landmarker")
-                        landmarker.close()
                         landmarker = None
 
             if inferenceInterval == 0 or (now - lastInferenceTime) >= inferenceInterval:
@@ -1621,9 +1741,9 @@ def main():
                 break
     finally:
         if landmarker is not None:
-            landmarker.close()
+            landmarker = None
         if poseLandmarker is not None:
-            poseLandmarker.close()
+            poseLandmarker = None
         cap.release()
         publisher.stop()
         if DEBUG:

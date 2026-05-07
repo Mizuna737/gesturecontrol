@@ -14,11 +14,11 @@ import os
 
 _VENV = os.path.expanduser("~/.local/share/gesturecontrol/venv/bin/python3")
 
-# ── Re-exec through venv if it's ready ────────────────────────────────────────
+
 if sys.executable != _VENV and os.path.exists(_VENV):
     os.execv(_VENV, [_VENV] + sys.argv)
 
-# ── First-run setup (system Python only — venv packages not yet available) ────
+
 if not os.path.exists(_VENV):
     import subprocess
     import threading
@@ -99,7 +99,7 @@ if not os.path.exists(_VENV):
     # Venv now exists — re-exec under it so venv-only packages are available
     os.execv(_VENV, [_VENV] + sys.argv)
 
-# ── Normal imports (guaranteed to be running under venv from here) ─────────────
+
 import subprocess
 import threading
 import time
@@ -114,30 +114,28 @@ from PIL import Image, ImageDraw
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-SERVICE_NAME        = "gestureControl"
-CONFIG_PORT         = 7070
-ENGINE_STREAM_PORT  = 7071
-POLL_INTERVAL       = 3   # seconds
+SERVICE_NAME = "gestureControl"
+CONFIG_PORT = 7070
+ENGINE_STREAM_PORT = 7071
+POLL_INTERVAL = 3
 
-SCRIPTS_DIR   = Path(__file__).parent
+SCRIPTS_DIR = Path(__file__).parent
 CONFIG_SCRIPT = SCRIPTS_DIR / "gestureControl-config.py"
-VENV_PYTHON   = Path(_VENV)
+VENV_PYTHON = Path(_VENV)
 
 
-# ── Icon drawing ───────────────────────────────────────────────────────────────
-
-def _drawHand(draw, size, color):
-    """Draw a simplified open-hand silhouette into `draw` (PIL ImageDraw)."""
+def drawHand(draw, size, color):
+    """Draw a simplified open-hand silhouette into draw (PIL ImageDraw)."""
     palmL = size * 0.18
     palmR = size * 0.82
     palmT = size * 0.52
     palmB = size * 0.92
-    pr    = max(2, int(size * 0.08))
+    pr = max(2, int(size * 0.08))
     draw.rounded_rectangle([palmL, palmT, palmR, palmB], radius=pr, fill=color)
 
-    p        = max(2, size // 16)
-    fingerW  = (palmR - palmL - p * 4) / 5
-    heights  = [0.24, 0.10, 0.07, 0.12, 0.28]
+    p = max(2, size // 16)
+    fingerW = (palmR - palmL - p * 4) / 5
+    heights = [0.24, 0.10, 0.07, 0.12, 0.28]
     for i, topFrac in enumerate(heights):
         x0 = palmL + i * (fingerW + p)
         x1 = x0 + fingerW
@@ -149,17 +147,15 @@ def _drawHand(draw, size, color):
 
 def makePixbuf(active):
     """Return a GdkPixbuf for the tray icon."""
-    size  = 64
-    img   = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     color = (0, 230, 118, 255) if active else (110, 120, 150, 255)
-    _drawHand(ImageDraw.Draw(img), size, color)
+    drawHand(ImageDraw.Draw(img), size, color)
     data = GLib.Bytes.new(img.tobytes())
     return GdkPixbuf.Pixbuf.new_from_bytes(
         data, GdkPixbuf.Colorspace.RGB, True, 8, size, size, size * 4
     )
 
-
-# ── Service helpers ────────────────────────────────────────────────────────────
 
 def serviceActive():
     r = subprocess.run(
@@ -181,31 +177,28 @@ def serviceCtl(*args):
     subprocess.Popen(["systemctl", "--user", *args, SERVICE_NAME])
 
 
-# ── Config UI ─────────────────────────────────────────────────────────────────
+configProc = None
 
-_configProc = None
 
 def openConfigUI():
-    global _configProc
-    if _configProc is not None and _configProc.poll() is None:
-        return  # already open
+    global configProc
+    if configProc is not None and configProc.poll() is None:
+        return
 
-    # Ensure the engine is running before opening the UI
     if not serviceActive():
         serviceCtl("start")
 
-    # Wait for the engine's stream server to be ready (up to 10 s)
     import urllib.request
     for _ in range(40):
         try:
             urllib.request.urlopen(
-                f"http://127.0.0.1:{ENGINE_STREAM_PORT}/state", timeout=0.5
+                "http://127.0.0.1:" + str(ENGINE_STREAM_PORT) + "/state", timeout=0.5
             ).close()
             break
         except Exception:
             time.sleep(0.25)
 
-    _configProc = subprocess.Popen(
+    configProc = subprocess.Popen(
         [str(VENV_PYTHON), str(CONFIG_SCRIPT), "--window"],
         start_new_session=True,
     )
@@ -214,26 +207,26 @@ def openConfigUI():
 # ── Tray app ───────────────────────────────────────────────────────────────────
 
 class TrayApp:
+    """System tray application for gestureControl engine management."""
+
     def __init__(self):
-        self._active  = False
-        self._enabled = False
+        self.isActive = False
+        self.isEnabled = False
 
-        self._pollThread  = None
+        self.pollThread = None
 
-        self._statusIcon = Gtk.StatusIcon()
-        self._statusIcon.set_from_pixbuf(makePixbuf(False))
-        self._statusIcon.set_tooltip_text("gestureControl  ○  Stopped")
-        self._statusIcon.set_visible(True)
-        self._statusIcon.connect("popup-menu",       self._onPopupMenu)
-        self._statusIcon.connect("activate",         self._onActivate)
-        self._statusIcon.connect("notify::embedded", self._onEmbedded)
+        self.statusIcon = Gtk.StatusIcon()
+        self.statusIcon.set_from_pixbuf(makePixbuf(False))
+        self.statusIcon.set_tooltip_text("gestureControl  ○  Stopped")
+        self.statusIcon.set_visible(True)
+        self.statusIcon.connect("popup-menu", self.onPopupMenu)
+        self.statusIcon.connect("activate", self.onActivate)
+        self.statusIcon.connect("notify::embedded", self.onEmbedded)
 
-    # ── Menu ───────────────────────────────────────────────────────────────────
-
-    def _buildMenu(self):
+    def buildMenu(self):
         menu = Gtk.Menu()
 
-        label = "gestureControl  ●  Running" if self._active else "gestureControl  ○  Stopped"
+        label = "gestureControl  ●  Running" if self.isActive else "gestureControl  ○  Stopped"
         header = Gtk.MenuItem(label=label)
         header.set_sensitive(False)
         menu.append(header)
@@ -247,104 +240,97 @@ class TrayApp:
         menu.append(Gtk.SeparatorMenuItem())
 
         startItem = Gtk.MenuItem(label="Start Engine")
-        startItem.set_sensitive(not self._active)
-        startItem.connect("activate", self._onStart)
+        startItem.set_sensitive(not self.isActive)
+        startItem.connect("activate", self.onStart)
         menu.append(startItem)
 
         stopItem = Gtk.MenuItem(label="Stop Engine")
-        stopItem.set_sensitive(self._active)
-        stopItem.connect("activate", self._onStop)
+        stopItem.set_sensitive(self.isActive)
+        stopItem.connect("activate", self.onStop)
         menu.append(stopItem)
 
         restartItem = Gtk.MenuItem(label="Restart Engine")
-        restartItem.set_sensitive(self._active)
-        restartItem.connect("activate", self._onRestart)
+        restartItem.set_sensitive(self.isActive)
+        restartItem.connect("activate", self.onRestart)
         menu.append(restartItem)
 
         menu.append(Gtk.SeparatorMenuItem())
 
         loginItem = Gtk.CheckMenuItem(label="Start on Login")
-        loginItem.set_active(self._enabled)
-        loginItem.connect("toggled", self._onToggleEnabled)
+        loginItem.set_active(self.isEnabled)
+        loginItem.connect("toggled", self.onToggleEnabled)
         menu.append(loginItem)
 
         menu.append(Gtk.SeparatorMenuItem())
 
         quitItem = Gtk.MenuItem(label="Quit")
-        quitItem.connect("activate", self._onQuit)
+        quitItem.connect("activate", self.onQuit)
         menu.append(quitItem)
 
         menu.show_all()
         return menu
 
-    # ── Signal handlers ────────────────────────────────────────────────────────
-
-    def _onPopupMenu(self, icon, button, activateTime):
-        menu = self._buildMenu()
+    def onPopupMenu(self, icon, button, activateTime):
+        menu = self.buildMenu()
         menu.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, activateTime)
 
-    def _onActivate(self, icon):
+    def onActivate(self, icon):
         threading.Thread(target=openConfigUI, daemon=True).start()
 
-    def _onStart(self, _):
+    def onStart(self, _):
         serviceCtl("start")
-        GLib.timeout_add(1500, self._refreshStatus)
+        GLib.timeout_add(1500, self.refreshStatus)
 
-    def _onStop(self, _):
+    def onStop(self, _):
         serviceCtl("stop")
-        GLib.timeout_add(1500, self._refreshStatus)
+        GLib.timeout_add(1500, self.refreshStatus)
 
-    def _onRestart(self, _):
+    def onRestart(self, _):
         serviceCtl("restart")
-        GLib.timeout_add(1500, self._refreshStatus)
+        GLib.timeout_add(1500, self.refreshStatus)
 
-    def _onToggleEnabled(self, item):
+    def onToggleEnabled(self, item):
         if item.get_active():
             serviceCtl("enable")
         else:
             serviceCtl("disable")
 
-    def _onQuit(self, _):
+    def onQuit(self, _):
         Gtk.main_quit()
 
-    # ── Status polling ─────────────────────────────────────────────────────────
-
-    def _refreshStatus(self):
+    def refreshStatus(self):
         """Called on a background thread; schedules GTK updates via GLib.idle_add."""
-        active  = serviceActive()
+        active = serviceActive()
         enabled = serviceEnabled()
-        GLib.idle_add(self._applyStatus, active, enabled)
-        return False   # don't repeat (GLib.timeout_add callback)
+        GLib.idle_add(self.applyStatus, active, enabled)
+        return False
 
-    def _onEmbedded(self, icon, _param):
+    def onEmbedded(self, icon, _param):
         """Fires when a tray manager claims (or releases) the icon."""
-        if icon.get_property("embedded") and self._pollThread is None:
-            self._refreshStatus()
-            self._pollThread = threading.Thread(target=self._pollWorker, daemon=True)
-            self._pollThread.start()
+        if icon.get_property("embedded") and self.pollThread is None:
+            self.refreshStatus()
+            self.pollThread = threading.Thread(target=self.pollWorker, daemon=True)
+            self.pollThread.start()
 
-    def _applyStatus(self, active, enabled):
+    def applyStatus(self, active, enabled):
         """Must run on the GTK main thread."""
-        if not self._statusIcon.get_property("embedded"):
+        if not self.statusIcon.get_property("embedded"):
             return False
-        self._active  = active
-        self._enabled = enabled
-        self._statusIcon.set_from_pixbuf(makePixbuf(active))
-        self._statusIcon.set_tooltip_text(
-            f"gestureControl  {'●' if active else '○'}  {'Running' if active else 'Stopped'}"
+        self.isActive = active
+        self.isEnabled = enabled
+        self.statusIcon.set_from_pixbuf(makePixbuf(active))
+        self.statusIcon.set_tooltip_text(
+            "gestureControl  " + ("●" if active else "○") + "  " + ("Running" if active else "Stopped")
         )
-        return False   # don't repeat (GLib.idle_add callback)
+        return False
 
-    def _pollWorker(self):
+    def pollWorker(self):
         """Background thread that periodically refreshes status."""
         while True:
-            self._refreshStatus()
+            self.refreshStatus()
             time.sleep(POLL_INTERVAL)
 
-    # ── Run ────────────────────────────────────────────────────────────────────
-
     def run(self):
-        # Poll thread is deferred until notify::embedded fires.
         Gtk.main()
 
 

@@ -22,7 +22,6 @@ if sys.executable != _VENV and os.path.exists(_VENV):
 
 import argparse
 import atexit
-import collections
 import json
 import threading
 import time
@@ -32,118 +31,28 @@ from pathlib import Path
 
 import cv2
 import mediapipe as mp
+from poseUtils import (
+    HAND_CONNECTIONS,
+    DarkFrameDetector,
+    DEFAULT_SPREAD_THRESHOLD,
+    classifyPose,
+    computeFingerSpreads,
+    fingerStates,
+)
 from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-MODEL_PATH          = Path.home() / ".local" / "share" / "gesturecontrol" / "hand_landmarker.task"
-DEFAULT_CONFIG      = Path.home() / ".config" / "gesturecontrol"
-UI_DIR              = Path(__file__).parent / "gestureControl-config-ui"
-ENGINE_STREAM_PORT  = 7071  # must match gestureControl.py --stream-port default
-LOCK_FILE           = Path.home() / ".local" / "share" / "gesturecontrol" / "config-ui.pid"
+MODEL_PATH = Path.home() / ".local" / "share" / "gesturecontrol" / "hand_landmarker.task"
+DEFAULT_CONFIG = Path.home() / ".config" / "gesturecontrol"
+UI_DIR = Path(__file__).parent / "gestureControl-config-ui"
+ENGINE_STREAM_PORT = 7071
+LOCK_FILE = Path.home() / ".local" / "share" / "gesturecontrol" / "config-ui.pid"
 
-# ── MediaPipe aliases ──────────────────────────────────────────────────────────
-
-BaseOptions           = mp.tasks.BaseOptions
-HandLandmarker        = mp.tasks.vision.HandLandmarker
+BaseOptions = mp.tasks.BaseOptions
+HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-VisionRunningMode     = mp.tasks.vision.RunningMode
-
-HAND_CONNECTIONS = [
-    (0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
-    (5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),
-    (13,17),(0,17),(17,18),(18,19),(19,20),
-]
-
-# ── Dark-frame detector ────────────────────────────────────────────────────────
-
-class DarkFrameDetector:
-    _WARMUP_THRESHOLD = 20.0
-    _WINDOW           = 30
-    _MIN_SPREAD       = 5.0
-    _SPLIT_FRAC       = 0.4
-
-    def __init__(self):
-        self._recent = collections.deque(maxlen=self._WINDOW)
-
-    def isDark(self, mean):
-        self._recent.append(mean)
-        if len(self._recent) < 10:
-            return mean < self._WARMUP_THRESHOLD
-        lo = min(self._recent)
-        hi = max(self._recent)
-        if hi - lo < self._MIN_SPREAD:
-            return False
-        return mean < lo + (hi - lo) * self._SPLIT_FRAC
-
-
-# ── Pose helpers ───────────────────────────────────────────────────────────────
-
-DEFAULT_SPREAD_THRESHOLD = 0.20
-
-
-def fingerStates(landmarks, handLabel):
-    lm      = landmarks
-    index   = lm[8].y  < lm[6].y
-    middle  = lm[12].y < lm[10].y
-    ring    = lm[16].y < lm[14].y
-    pinky   = lm[20].y < lm[18].y
-    isRight = handLabel == "Right"
-    thumb   = lm[4].x > lm[3].x if isRight else lm[4].x < lm[3].x
-    return [thumb, index, middle, ring, pinky]
-
-
-def computeFingerSpreads(landmarks):
-    """Normalized tip-to-tip gaps for the four adjacent finger pairs."""
-    def d(a, b):
-        dx = landmarks[a].x - landmarks[b].x
-        dy = landmarks[a].y - landmarks[b].y
-        return (dx * dx + dy * dy) ** 0.5
-
-    refLen = d(0, 9)
-    if refLen < 1e-6:
-        return {"thumbIndex": 0.0, "indexMiddle": 0.0, "middleRing": 0.0, "ringPinky": 0.0}
-    return {
-        "thumbIndex":  d(4,  8)  / refLen,
-        "indexMiddle": d(8,  12) / refLen,
-        "middleRing":  d(12, 16) / refLen,
-        "ringPinky":   d(16, 20) / refLen,
-    }
-
-
-def checkSpreadConstraint(value, constraint, threshold):
-    if constraint is None:
-        return True
-    if isinstance(constraint, float):
-        return value >= constraint
-    if constraint == "apart":
-        return value >= threshold
-    if constraint == "close":
-        return value < threshold
-    return True
-
-
-def classifyPose(landmarks, handLabel, poses, spreadThreshold=DEFAULT_SPREAD_THRESHOLD):
-    """Match finger states and spread constraints; returns first match name or None."""
-    states  = fingerStates(landmarks, handLabel)
-    spreads = computeFingerSpreads(landmarks)
-    for pose in poses:
-        constraints = [
-            pose.get("thumb"), pose.get("index"), pose.get("middle"),
-            pose.get("ring"),  pose.get("pinky"),
-        ]
-        if not all(c is None or c == s for c, s in zip(constraints, states)):
-            continue
-        spreadConstraints = [
-            (spreads["thumbIndex"],  pose.get("spread_thumb_index")),
-            (spreads["indexMiddle"], pose.get("spread_index_middle")),
-            (spreads["middleRing"],  pose.get("spread_middle_ring")),
-            (spreads["ringPinky"],   pose.get("spread_ring_pinky")),
-        ]
-        if all(checkSpreadConstraint(v, c, spreadThreshold) for v, c in spreadConstraints):
-            return pose["name"]
-    return None
-
+VisionRunningMode = mp.tasks.vision.RunningMode
 
 # ── Shared camera state ────────────────────────────────────────────────────────
 
@@ -151,10 +60,10 @@ class CameraState:
     """Thread-safe container for the latest annotated frame and hand state."""
 
     def __init__(self):
-        self._lock  = threading.Lock()
-        self._frame = None   # latest JPEG bytes
-        self._hands = {}     # {side: {"fingers": [T,I,M,R,P], "pose": str|None}}
-        self._error = None   # string if camera failed to open
+        self._lock = threading.Lock()
+        self._frame = None
+        self._hands = {}
+        self._error = None
 
     def reset(self):
         with self._lock:
@@ -193,13 +102,13 @@ def cameraThread(camInput, cfgDir, state, stopEvent):
         try:
             with open(triggersPath, "rb") as f:
                 cfg = tomllib.load(f)
-            threshold = cfg.get("settings", {}).get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
+            threshold = cfg.get("settings", {}).get("spreadThreshold", cfg.get("settings", {}).get("spread_threshold", DEFAULT_SPREAD_THRESHOLD))
             return cfg.get("poses", []), threshold
         except Exception:
             return [], DEFAULT_SPREAD_THRESHOLD
 
     if not MODEL_PATH.exists():
-        state.setError(f"Model not found at {MODEL_PATH}\nRun gestureControl-setup.sh first.")
+        state.setError("Model not found at " + str(MODEL_PATH) + "\nRun gestureControl-setup.sh first.")
         return
 
     try:
@@ -209,27 +118,24 @@ def cameraThread(camInput, cfgDir, state, stopEvent):
 
     cap = cv2.VideoCapture(camIndex, cv2.CAP_V4L2)
     if not cap.isOpened():
-        state.setError(
-            f"Cannot open camera {camInput!r}\n"
-            "Is the gesture engine already running?"
-        )
+        state.setError("Cannot open camera " + repr(camInput) + "\nIs the gesture engine already running?")
         return
 
     options = HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
-        running_mode=VisionRunningMode.VIDEO,
-        num_hands=2,
-        min_hand_detection_confidence=0.7,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        baseOptions=BaseOptions(modelAssetPath=str(MODEL_PATH)),
+        runningMode=VisionRunningMode.VIDEO,
+        numHands=2,
+        minHandDetectionConfidence=0.7,
+        minHandPresenceConfidence=0.5,
+        minTrackingConfidence=0.5,
     )
 
-    darkDetector    = DarkFrameDetector()
+    darkDetector = DarkFrameDetector()
     poses, spreadThreshold = loadPosesAndSettings()
-    nextPoseReload  = time.monotonic() + 2.0
+    nextPoseReload = time.monotonic() + 2.0
 
-    with HandLandmarker.create_from_options(options) as landmarker:
-        while not stopEvent.is_set():
+    with HandLandmarker.createFromOptions(options) as landmarker:
+        while not stopEvent.isSet():
             now = time.monotonic()
             if now >= nextPoseReload:
                 poses, spreadThreshold = loadPosesAndSettings()
@@ -246,31 +152,31 @@ def cameraThread(camInput, cfgDir, state, stopEvent):
             if darkDetector.isDark(frame.mean()):
                 continue
 
-            rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mpImg = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            tsMs  = int(time.monotonic() * 1000)
-            result = landmarker.detect_for_video(mpImg, tsMs)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mpImg = mp.Image(imageFormat=mp.ImageFormat.SRGB, data=rgb)
+            tsMs = int(time.monotonic() * 1000)
+            result = landmarker.detectForVideo(mpImg, tsMs)
 
             hands = {}
             for i, handedness in enumerate(result.handedness):
-                mpLabel = handedness[0].category_name
-                side    = "right" if mpLabel == "Left" else "left"
-                lm      = result.hand_landmarks[i]
+                mpLabel = handedness[0].categoryName
+                side = "right" if mpLabel == "Left" else "left"
+                lm = result.handLandmarks[i]
                 fingers = fingerStates(lm, mpLabel)
                 spreads = computeFingerSpreads(lm)
-                pose    = classifyPose(lm, mpLabel, poses, spreadThreshold)
+                pose = classifyPose(lm, mpLabel, poses, spreadThreshold)
                 hands[side] = {"fingers": fingers, "spreads": spreads, "pose": pose}
 
                 h, w = frame.shape[:2]
-                pts  = [(int(l.x * w), int(l.y * h)) for l in lm]
+                pts = [(int(l.x * w), int(l.y * h)) for l in lm]
                 for a, b in HAND_CONNECTIONS:
                     cv2.line(frame, pts[a], pts[b], (0, 200, 255), 2)
                 for pt in pts:
                     cv2.circle(frame, pt, 4, (255, 255, 255), -1)
 
                 label = pose or "---"
-                yPos  = 36 if side == "right" else 66
-                cv2.putText(frame, f"{side[0].upper()}: {label}",
+                yPos = 36 if side == "right" else 66
+                cv2.putText(frame, side[0].upper() + ": " + label,
                             (10, yPos), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 230, 80), 2)
 
             state.setHands(hands)
@@ -286,16 +192,16 @@ def _tomlVal(v):
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, str):
-        return f'"{v}"'
+        return '"' + v + '"'
     if isinstance(v, (int, float)):
         return str(v)
     if isinstance(v, list):
         return "[" + ", ".join(_tomlVal(i) for i in v) + "]"
-    raise ValueError(f"Cannot TOML-serialize {v!r}")
+    raise ValueError("Cannot TOML-serialize " + repr(v))
 
 
 def _inlineTable(d):
-    parts = [f"{k} = {_tomlVal(v)}" for k, v in d.items() if v is not None]
+    parts = [k + " = " + _tomlVal(v) for k, v in d.items() if v is not None]
     return "{ " + ", ".join(parts) + " }"
 
 
@@ -306,35 +212,35 @@ def serializeTriggersTOML(data):
     if settings:
         lines.append("[settings]")
         for k, v in settings.items():
-            lines.append(f"{k} = {_tomlVal(v)}")
+            lines.append(k + " = " + _tomlVal(v))
         lines.append("")
 
     for pose in data.get("poses", []):
         lines.append("[[poses]]")
-        lines.append(f'name = "{pose["name"]}"')
+        lines.append('name = "' + pose["name"] + '"')
         for finger in ("thumb", "index", "middle", "ring", "pinky"):
             val = pose.get(finger)
             if val is not None:
-                lines.append(f"{finger} = {_tomlVal(val)}")
-        for spreadKey in ("spread_thumb_index", "spread_index_middle",
-                          "spread_middle_ring", "spread_ring_pinky"):
+                lines.append(finger + " = " + _tomlVal(val))
+        for spreadKey in ("spreadThumbIndex", "spreadIndexMiddle",
+                          "spreadMiddleRing", "spreadRingPinky"):
             val = pose.get(spreadKey)
             if val is not None:
-                lines.append(f"{spreadKey} = {_tomlVal(val)}")
+                lines.append(spreadKey + " = " + _tomlVal(val))
         lines.append("")
 
     for binding in data.get("bindings", []):
         lines.append("[[bindings]]")
-        lines.append(f'name = "{binding["name"]}"')
+        lines.append('name = "' + binding["name"] + '"')
         reqs = binding.get("require") or []
         if reqs:
-            parts = ", ".join(f'{{hand = "{r["hand"]}", pose = "{r["pose"]}"}}'  for r in reqs)
-            lines.append(f"require = [{parts}]")
+            parts = ", ".join('{hand = "' + r["hand"] + '", pose = "' + r["pose"] + '"}'  for r in reqs)
+            lines.append("require = [" + parts + "]")
 
-        t  = binding["trigger"]
+        t = binding["trigger"]
         td = {k: v for k, v in t.items() if v is not None}
 
-        lines.append(f"trigger = {_inlineTable(td)}")
+        lines.append("trigger = " + _inlineTable(td))
         lines.append("")
 
     return "\n".join(lines)
@@ -344,33 +250,34 @@ def serializeActionsTOML(data):
     lines = []
     for binding in data.get("bindings", []):
         lines.append("[[bindings]]")
-        lines.append(f'signal = "{binding["signal"]}"')
+        lines.append('signal = "' + binding["signal"] + '"')
         if binding.get("context"):
-            lines.append(f'context = "{binding["context"]}"')
-        lines.append(f"action = {_inlineTable(binding['action'])}")
-        if binding.get("on_end"):
-            lines.append(f"on_end = {_inlineTable(binding['on_end'])}")
+            lines.append('context = "' + binding["context"] + '"')
+        lines.append("action = " + _inlineTable(binding["action"]))
+        onEndVal = binding.get("onEnd")
+        if onEndVal:
+            lines.append("onEnd = " + _inlineTable(onEndVal))
         lines.append("")
     return "\n".join(lines)
 
 
 # ── Single-instance lock ───────────────────────────────────────────────────────
 
-def _acquireLock():
+def acquireLock():
     """Return True if this process is the sole running instance."""
     if LOCK_FILE.exists():
         try:
             pid = int(LOCK_FILE.read_text().strip())
-            os.kill(pid, 0)   # signal 0: probe without sending
-            return False      # another instance is alive
+            os.kill(pid, 0)
+            return False
         except (ProcessLookupError, PermissionError, ValueError):
-            pass              # stale lock — overwrite it
+            pass
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     LOCK_FILE.write_text(str(os.getpid()))
     return True
 
 
-def _releaseLock():
+def releaseLock():
     try:
         LOCK_FILE.unlink(missing_ok=True)
     except OSError:
@@ -379,7 +286,7 @@ def _releaseLock():
 
 # ── GTK/WebKit2 window ────────────────────────────────────────────────────────
 
-def _openInWindow(port):
+def openInWindow(port):
     """Open the config UI in a standalone GTK window using WebKit2."""
     import gi
     gi.require_version("Gtk", "3.0")
@@ -399,9 +306,9 @@ def _openInWindow(port):
     win.add(webview)
     win.show_all()
 
-    def _loadWhenReady():
+    def loadWhenReady():
         import urllib.request
-        url = f"http://127.0.0.1:{port}/"
+        url = "http://127.0.0.1:" + str(port) + "/"
         for _ in range(40):
             try:
                 urllib.request.urlopen(url, timeout=0.3).close()
@@ -409,33 +316,33 @@ def _openInWindow(port):
                 return False
             except Exception:
                 time.sleep(0.15)
-        webview.load_uri(url)   # last-ditch attempt
+        webview.load_uri(url)
         return False
 
-    GLib.idle_add(_loadWhenReady)
+    GLib.idle_add(loadWhenReady)
     Gtk.main()
 
 
 # ── Flask app ──────────────────────────────────────────────────────────────────
 
-app             = Flask(__name__, static_folder=None)
-cameraState     = CameraState()
-configDir       = DEFAULT_CONFIG
-useEngineStream = False   # set in main() after checking engine availability
+app = Flask(__name__, static_folder=None)
+cameraState = CameraState()
+configDir = DEFAULT_CONFIG
+useEngineStream = False
 
-_cameraStopEvent = None  # threading.Event for the current camera thread
+cameraStopEvent = None
 
 
-def _restartCameraThread(camInput):
+def restartCameraThread(camInput):
     """Stop the existing camera thread (if any) and start a new one."""
-    global _cameraStopEvent
-    if _cameraStopEvent is not None:
-        _cameraStopEvent.set()
+    global cameraStopEvent
+    if cameraStopEvent is not None:
+        cameraStopEvent.set()
     cameraState.reset()
-    _cameraStopEvent = threading.Event()
+    cameraStopEvent = threading.Event()
     threading.Thread(
         target=cameraThread,
-        args=(camInput, configDir, cameraState, _cameraStopEvent),
+        args=(camInput, configDir, cameraState, cameraStopEvent),
         daemon=True,
     ).start()
 
@@ -645,7 +552,7 @@ def setCamera():
         subprocess.Popen(["systemctl", "--user", "restart", "gestureControl.service"])
         return jsonify({"ok": True, "restarted": True})
     else:
-        _restartCameraThread(camIndex)
+        restartCameraThread(camIndex)
         return jsonify({"ok": True, "restarted": False})
 
 
@@ -676,10 +583,10 @@ def main():
                         help="Open in a standalone GTK window instead of the browser")
     args = parser.parse_args()
 
-    if not _acquireLock():
+    if not acquireLock():
         print("gestureControl-config is already running.", file=sys.stderr)
         sys.exit(0)
-    atexit.register(_releaseLock)
+    atexit.register(releaseLock)
 
     configDir = Path(args.config)
 
@@ -696,7 +603,7 @@ def main():
                     camInput = tomllib.load(f).get("settings", {}).get("camera", 0)
             else:
                 camInput = 0
-        _restartCameraThread(camInput)
+        restartCameraThread(camInput)
         print("[camera] starting own camera thread")
 
     print(f"gestureControl-config  →  http://localhost:{args.port}")
@@ -706,7 +613,7 @@ def main():
             target=lambda: app.run(host="127.0.0.1", port=args.port, threaded=True),
             daemon=True,
         ).start()
-        _openInWindow(args.port)
+        openInWindow(args.port)
     else:
         def openBrowser():
             time.sleep(1.2)
