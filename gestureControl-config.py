@@ -22,7 +22,10 @@ if sys.executable != _VENV and os.path.exists(_VENV):
 
 import argparse
 import atexit
+import glob
 import json
+import re
+import subprocess
 import threading
 import time
 import tomllib
@@ -121,20 +124,21 @@ def cameraThread(camInput, cfgDir, state, stopEvent):
         state.setError("Cannot open camera " + repr(camInput) + "\nIs the gesture engine already running?")
         return
 
+    """MediaPipe Tasks Python API follows PEP 8 snake_case; camelCase kwargs raise TypeError."""
     options = HandLandmarkerOptions(
-        baseOptions=BaseOptions(modelAssetPath=str(MODEL_PATH)),
-        runningMode=VisionRunningMode.VIDEO,
-        numHands=2,
-        minHandDetectionConfidence=0.7,
-        minHandPresenceConfidence=0.5,
-        minTrackingConfidence=0.5,
+        base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
+        running_mode=VisionRunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.7,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
     )
 
     darkDetector = DarkFrameDetector()
     poses, spreadThreshold = loadPosesAndSettings()
     nextPoseReload = time.monotonic() + 2.0
 
-    with HandLandmarker.createFromOptions(options) as landmarker:
+    with HandLandmarker.create_from_options(options) as landmarker:
         while not stopEvent.isSet():
             now = time.monotonic()
             if now >= nextPoseReload:
@@ -153,9 +157,9 @@ def cameraThread(camInput, cfgDir, state, stopEvent):
                 continue
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mpImg = mp.Image(imageFormat=mp.ImageFormat.SRGB, data=rgb)
+            mpImg = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             tsMs = int(time.monotonic() * 1000)
-            result = landmarker.detectForVideo(mpImg, tsMs)
+            result = landmarker.detect_for_video(mpImg, tsMs)
 
             hands = {}
             for i, handedness in enumerate(result.handedness):
@@ -213,6 +217,14 @@ def serializeTriggersTOML(data):
         lines.append("[settings]")
         for k, v in settings.items():
             lines.append(k + " = " + _tomlVal(v))
+        lines.append("")
+
+    presence = data.get("presence")
+    if presence:
+        lines.append("[presence]")
+        for k, v in presence.items():
+            if v is not None:
+                lines.append(k + " = " + _tomlVal(v))
         lines.append("")
 
     for pose in data.get("poses", []):
@@ -458,10 +470,11 @@ def getConfig():
             actionsRaw = tomllib.load(f)
 
     return jsonify({
-        "settings": triggersRaw.get("settings", {}),
-        "poses":    triggersRaw.get("poses", []),
-        "triggers": triggersRaw.get("bindings", []),
-        "actions":  actionsRaw.get("bindings", []),
+        "settings":  triggersRaw.get("settings", {}),
+        "poses":     triggersRaw.get("poses", []),
+        "triggers":  triggersRaw.get("bindings", []),
+        "actions":   actionsRaw.get("bindings", []),
+        "presence":  triggersRaw.get("presence", {}),
     })
 
 
@@ -473,6 +486,7 @@ def saveTriggers():
         "settings": data.get("settings", {}),
         "poses":    data.get("poses", []),
         "bindings": data.get("triggers", []),
+        "presence": data.get("presence", {}),
     }
     try:
         outPath.write_text(serializeTriggersTOML(payload))
@@ -493,10 +507,13 @@ def saveActions():
         return jsonify({"ok": False, "error": str(e)}), 400
 
 
+_reV4l2DeviceName = re.compile(r"^(.+?)\s*\(")
+_reVideoIndex    = re.compile(r"^/dev/video(\d+)$")
+
+
 @app.route("/api/cameras")
 def listCameras():
     """Return available V4L2 video devices with friendly names where possible."""
-    import subprocess, re, glob as _glob
     cameras = []
     nameMap = {}
     try:
@@ -505,19 +522,18 @@ def listCameras():
         )
         currentName = None
         for line in out.splitlines():
-            m = re.match(r"^(.+?)\s*\(", line)
+            m = _reV4l2DeviceName.match(line)
             if m:
                 currentName = m.group(1).strip()
             else:
-                stripped = line.strip()
-                m2 = re.match(r"^/dev/video(\d+)$", stripped)
+                m2 = _reVideoIndex.match(line.strip())
                 if m2 and currentName:
                     nameMap[int(m2.group(1))] = currentName
     except Exception:
         pass
 
-    for path in sorted(_glob.glob("/dev/video*")):
-        m = re.match(r"/dev/video(\d+)$", path)
+    for path in sorted(glob.glob("/dev/video*")):
+        m = _reVideoIndex.match(path)
         if not m:
             continue
         idx  = int(m.group(1))
@@ -548,7 +564,6 @@ def setCamera():
         return jsonify({"ok": False, "error": str(e)}), 400
 
     if useEngineStream:
-        import subprocess
         subprocess.Popen(["systemctl", "--user", "restart", "gestureControl.service"])
         return jsonify({"ok": True, "restarted": True})
     else:

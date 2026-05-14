@@ -166,6 +166,44 @@ body {
   color: var(--accent);
 }
 
+/* ── Presence status ── */
+#presence-status {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.presence-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.presence-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+  transition: background 0.2s;
+}
+.presence-dot.active { background: var(--accent); }
+.presence-dot.inactive { background: var(--red); }
+.presence-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.presence-details {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
 #capture-btn {
   margin-top: auto;
 }

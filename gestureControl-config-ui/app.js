@@ -29,15 +29,32 @@ let editingPrefixSteps = [];
 let editingRequire = [];
 
 
+const FINGER_NAMES  = ["thumb","index","middle","ring","pinky"];
+const FINGER_LABELS = ["Thumb","Index","Middle","Ring","Pinky"];
+
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 async function loadConfig() {
   const res  = await fetch("/api/config");
   const data = await res.json();
-  state.settings = data.settings || {};
+
+  const s = data.settings || {};
+  if ("dwell_ms"         in s && !("dwellMs"         in s)) s.dwellMs         = s.dwell_ms;
+  if ("spread_threshold" in s && !("spreadThreshold" in s)) s.spreadThreshold = s.spread_threshold;
+  if ("grace_period_ms"  in s && !("gracePeriodMs"   in s)) s.gracePeriodMs   = s.grace_period_ms;
+
+  for (const binding of data.triggers || []) {
+    const t = binding.trigger || {};
+    if (t.type === "sequenced_continuous") t.type = "sequencedContinuous";
+    if ("prefix_steps" in t && !("prefixSteps" in t)) t.prefixSteps = t.prefix_steps;
+  }
+
+  state.settings = s;
   state.poses    = data.poses    || [];
   state.triggers = data.triggers || [];
   state.actions  = data.actions  || [];
+  state.presence = data.presence || {};
   renderAll();
   loadCameras();
 }
@@ -47,18 +64,59 @@ function renderAll() {
   renderTriggers();
   renderActions();
   renderSettings();
+  renderPresenceSettings();
 }
 
 function renderSettings() {
-  const dwellEl    = document.getElementById("setting-dwell-ms");
-  const spreadEl   = document.getElementById("setting-spread-threshold");
-  if (dwellEl)  dwellEl.value  = state.settings.dwellMs ?? state.settings.dwell_ms ?? 200;
-  if (spreadEl) spreadEl.value = state.settings.spreadThreshold ?? state.settings.spread_threshold ?? 0.20;
+  const dwellEl      = document.getElementById("setting-dwell-ms");
+  const spreadEl     = document.getElementById("setting-spread-threshold");
+  const graceEl      = document.getElementById("setting-grace-period-ms");
+  if (dwellEl)  dwellEl.value  = state.settings.dwellMs         ?? 200;
+  if (spreadEl) spreadEl.value = state.settings.spreadThreshold ?? 0.20;
+  if (graceEl)  graceEl.value  = state.settings.gracePeriodMs   ?? 200;
+}
+
+function renderPresenceSettings() {
+  const p = state.presence || {};
+  const enabledEl = document.getElementById("setting-presence-enabled");
+  const useMotionEl = document.getElementById("setting-presence-use-motion");
+  const idleEl = document.getElementById("setting-presence-idle-seconds");
+  const thresholdEl = document.getElementById("setting-presence-motion-threshold");
+  const checkHzEl = document.getElementById("setting-presence-check-hz");
+  const checkModeEl = document.getElementById("setting-presence-check-mode");
+  const pauseHandsEl = document.getElementById("setting-presence-pause-hands");
+  const poseDetectionEl = document.getElementById("setting-presence-pose-detection");
+  const poseMinConfEl = document.getElementById("setting-presence-pose-min-conf");
+
+  if (enabledEl)    enabledEl.checked = !!p.enabled;
+  if (useMotionEl)  useMotionEl.checked = p.useMotionDetection !== false;
+  if (idleEl)       idleEl.value = p.idleSeconds ?? 300;
+  if (thresholdEl)  thresholdEl.value = p.motionThreshold ?? 5.0;
+  if (checkHzEl)    checkHzEl.value = p.checkHz ?? 2;
+  if (checkModeEl)  checkModeEl.value = p.poseCheckMode || "fallback";
+  if (pauseHandsEl) pauseHandsEl.checked = p.pauseHandsWhenAbsent !== false;
+  if (poseDetectionEl) poseDetectionEl.checked = !!p.poseDetection;
+  if (poseMinConfEl) poseMinConfEl.value = p.poseMinConfidence ?? 0.5;
 }
 
 function onSettingChange(key, value) {
   if (isNaN(value)) return;
   state.settings[key] = value;
+  markDirty();
+}
+
+function onPresenceChange() {
+  state.presence = {
+    enabled: document.getElementById("setting-presence-enabled").checked,
+    useMotionDetection: document.getElementById("setting-presence-use-motion").checked,
+    idleSeconds: parseInt(document.getElementById("setting-presence-idle-seconds").value, 10) || 300,
+    motionThreshold: parseFloat(document.getElementById("setting-presence-motion-threshold").value) || 5.0,
+    checkHz: parseInt(document.getElementById("setting-presence-check-hz").value, 10) || 2,
+    poseCheckMode: document.getElementById("setting-presence-check-mode").value,
+    pauseHandsWhenAbsent: document.getElementById("setting-presence-pause-hands").checked,
+    poseDetection: document.getElementById("setting-presence-pose-detection").checked,
+    poseMinConfidence: parseFloat(document.getElementById("setting-presence-pose-min-conf").value) || 0.5,
+  };
   markDirty();
 }
 
@@ -166,6 +224,8 @@ function startSSE() {
     updateFingerDisplay("right", liveFingers.right, livePose.right);
     updateFingerDisplay("left",  liveFingers.left,  livePose.left);
 
+    updatePresenceDisplay(data.presence || {});
+
     // Update the capture row inside an open pose modal
     updateCaptureRow();
 
@@ -214,7 +274,7 @@ function updateFingerDisplay(side, fingers, pose) {
   const row = document.getElementById(`hand-${side}`);
   if (!fingers) {
     row.classList.remove("active");
-    ["thumb","index","middle","ring","pinky"].forEach((f, i) => {
+    FINGER_NAMES.forEach((f, i) => {
       const dot = document.getElementById(`${side[0]}-${f}`);
       dot.classList.remove("on");
     });
@@ -231,6 +291,53 @@ function updateFingerDisplay(side, fingers, pose) {
   const chip = document.getElementById(`${side[0]}-pose`);
   chip.textContent = pose || "---";
   chip.classList.toggle("matched", !!pose);
+}
+
+function updatePresenceDisplay(p) {
+  const el = document.getElementById("presence-status");
+  const dot = document.getElementById("presence-dot");
+  const label = document.getElementById("presence-label");
+  const details = document.getElementById("presence-details");
+
+  if (!el || !dot || !label || !details) return;
+
+  if (!p.enabled) {
+    el.classList.add("hidden");
+    return;
+  }
+
+  el.classList.remove("hidden");
+
+  const isPresent = !!p.motionDetected;
+  const isMotion = p.motionDetected && !p.poseDetected;
+  const isPose = !!p.poseDetected;
+
+  dot.className = "presence-dot " + (isPresent ? "active" : "inactive");
+  label.textContent = isPresent ? "Present" : "Absent";
+
+  const idleSecs = p.idleSeconds || 300;
+  const sinceActive = Math.round((p.timeSinceLastActive || 0) / 1000);
+  const timeLeft = Math.max(0, idleSecs - sinceActive);
+
+  let parts = [];
+  if (isPose && isMotion) {
+    parts.push("Motion + pose");
+  } else if (isPose) {
+    parts.push(p.useMotionDetection ? "Pose" : "Person detected");
+  } else if (isMotion) {
+    parts.push(p.useMotionDetection ? "Motion" : "Motion");
+  } else {
+    parts.push("No motion");
+  }
+  if (!isPresent) {
+    parts.push(`blank in ${timeLeft}s`);
+  } else {
+    parts.push(`active ${sinceActive}s ago`);
+  }
+  if (p.poseDetection) {
+    parts.push(`pose:${p.checkHz}Hz`);
+  }
+  details.textContent = parts.join("  ·  ");
 }
 
 
@@ -268,7 +375,7 @@ async function saveAll() {
     fetch("/api/config/triggers", {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ settings: state.settings, poses: state.poses, triggers: state.triggers }),
+      body:    JSON.stringify({ settings: state.settings, poses: state.poses, triggers: state.triggers, presence: state.presence }),
     }),
     fetch("/api/config/actions", {
       method:  "POST",
@@ -422,9 +529,6 @@ function updateCaptureRow() {
 
 
 // ── Pose editing ──────────────────────────────────────────────────────────────
-
-const FINGER_NAMES  = ["thumb","index","middle","ring","pinky"];
-const FINGER_LABELS = ["Thumb","Index","Middle","Ring","Pinky"];
 
 // Adjacent finger pairs — config key, display label, live spread key
 const SPREAD_PAIRS = [
@@ -649,43 +753,49 @@ const TRIGGER_TYPES = [
     sectionId: "trig-cont-section",
     usesHand: true,
     usesCrossHand: true,
-    fieldsHtml(trig) {
-      return `
-        <div class="field-row">
-          <div class="field">
-            <label>Metric</label>
-            <select id="trig-metric-cont">
-              ${METRICS.map(m => `<option value="${m}" ${m === trig.metric ? "selected" : ""}>${m}</option>`).join("")}
-            </select>
-          </div>
-        </div>
-        <div class="field">
-          <label>Range <span style="font-weight:400;color:var(--text-muted)">[min, max] raw sensor value</span></label>
-          <div class="range-row">
-            <input id="trig-range-lo-cont" type="number" step="0.01" placeholder="0.0" value="${trig.range?.[0] ?? ""}">
-            <span class="range-sep">→</span>
-            <input id="trig-range-hi-cont" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
-          </div>
-        </div>
-        <div class="field" style="max-width:160px">
-          <label>Hysteresis <span style="font-weight:400;color:var(--text-muted)">slot deadzone</span></label>
-          <input id="trig-hysteresis-cont" type="number" step="0.01" min="0" max="0.5"
-                 placeholder="0.04" value="${trig.hysteresis ?? ""}">
-        </div>`;
-    },
-    readFields() {
-      const modalBody = document.getElementById("modal-body");
-      const q = (id) => modalBody.querySelector(`#${id}`);
-      const metric     = q("trig-metric-cont").value;
-      const lo         = parseFloat(q("trig-range-lo-cont").value);
-      const hi         = parseFloat(q("trig-range-hi-cont").value);
-      const hysteresis = parseFloat(q("trig-hysteresis-cont").value);
-      return {
-        metric,
-        ...(!isNaN(lo) && !isNaN(hi) ? { range: [lo, hi] } : {}),
-        ...(!isNaN(hysteresis) ? { hysteresis } : {}),
-      };
-    },
+   fieldsHtml(trig) {
+       return `
+         <div class="field-row">
+           <div class="field">
+             <label>Metric</label>
+             <select id="trig-metric-cont">
+               ${METRICS.map(m => `<option value="${m}" ${m === trig.metric ? "selected" : ""}>${m}</option>`).join("")}
+             </select>
+           </div>
+         </div>
+         <div class="field">
+           <label>Range <span style="font-weight:400;color:var(--text-muted)">[min, max] raw sensor value</span></label>
+           <div class="range-row">
+             <input id="trig-range-lo-cont" type="number" step="0.01" placeholder="0.0" value="${trig.range?.[0] ?? ""}">
+             <span class="range-sep">→</span>
+             <input id="trig-range-hi-cont" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
+           </div>
+         </div>
+         <div class="field" style="max-width:160px">
+           <label>Hysteresis <span style="font-weight:400;color:var(--text-muted)">slot deadzone</span></label>
+           <input id="trig-hysteresis-cont" type="number" step="0.01" min="0" max="0.5"
+                  placeholder="0.04" value="${trig.hysteresis ?? ""}">
+         </div>
+         <div class="field" style="max-width:160px">
+           <label>Grace period (ms) <span style="font-weight:400;color:var(--text-muted)">hold last metric on tracking loss</span></label>
+           <input id="trig-grace-cont" type="number" min="0" step="10" value="${trig.gracePeriodMs ?? ""}">
+         </div>`;
+     },
+  readFields() {
+       const modalBody = document.getElementById("modal-body");
+       const q = (id) => modalBody.querySelector(`#${id}`);
+       const metric     = q("trig-metric-cont").value;
+       const lo         = parseFloat(q("trig-range-lo-cont").value);
+       const hi         = parseFloat(q("trig-range-hi-cont").value);
+       const hysteresis = parseFloat(q("trig-hysteresis-cont").value);
+       const graceMs    = parseInt(q("trig-grace-cont").value, 10);
+       return {
+         metric,
+         ...(!isNaN(lo) && !isNaN(hi) ? { range: [lo, hi] } : {}),
+         ...(!isNaN(hysteresis) ? { hysteresis } : {}),
+         ...(graceMs > 0 ? { gracePeriodMs: graceMs } : {}),
+       };
+     },
     meta(t) { return `continuous  •  ${t.hand || "?"}  •  ${t.metric || "?"}`; },
   },
   {
@@ -795,63 +905,69 @@ const TRIGGER_TYPES = [
     usesHand: true,
     usesCrossHand: true,
     onShow() { renderPrefixSteps(); },
-    fieldsHtml(trig) {
-      return `
-        <div class="field">
-          <label>Prefix steps — complete these to start the continuous gesture</label>
-          <div id="trig-prefix-steps-list"></div>
-          <div class="step-add-row">
-            <select id="trig-prefix-step-select">${poseOptions("")}</select>
-            <button class="btn-secondary" style="white-space:nowrap" onclick="addPrefixStep()">+ Add Step</button>
-          </div>
-        </div>
-        <div class="field-row">
-          <div class="field">
-            <label>Prefix window (ms) <span style="font-weight:400;color:var(--text-muted)">max time to complete sequence</span></label>
-            <input id="trig-prefix-window-ms-seq" type="number" min="100" step="100" value="${trig.prefixWindowMs ?? trig.prefix_window_ms ?? 1500}">
-          </div>
-          <div class="field">
-            <label>Prefix step dwell (ms)</label>
-            <input id="trig-prefix-dwell-ms-seq" type="number" min="0" step="10" value="${trig.prefixDwellMs ?? trig.prefix_dwell_ms ?? 100}">
-          </div>
-        </div>
-        <div class="field">
-          <label>Metric <span style="font-weight:400;color:var(--text-muted)">(continuous phase)</span></label>
-          <select id="trig-metric-seq">
-            ${METRICS.map(m => `<option value="${m}" ${m === trig.metric ? "selected" : ""}>${m}</option>`).join("")}
-          </select>
-        </div>
-        <div class="field">
-          <label>Range <span style="font-weight:400;color:var(--text-muted)">[min, max] raw sensor value</span></label>
-          <div class="range-row">
-            <input id="trig-range-lo-seq" type="number" step="0.01" placeholder="0.0" value="${trig.range?.[0] ?? ""}">
-            <span class="range-sep">→</span>
-            <input id="trig-range-hi-seq" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
-          </div>
-        </div>
-        <div class="field" style="max-width:160px">
-          <label>Hysteresis <span style="font-weight:400;color:var(--text-muted)">slot deadzone</span></label>
-          <input id="trig-hysteresis-seq" type="number" step="0.01" min="0" max="0.5"
-                 placeholder="0.04" value="${trig.hysteresis ?? ""}">
-        </div>`;
-    },
-    readFields() {
-      if (editingPrefixSteps.length < 1) { alert("At least one prefix step is required."); return null; }
-      const modalBody = document.getElementById("modal-body");
-      const q = (id) => modalBody.querySelector(`#${id}`);
-      const metric     = q("trig-metric-seq").value;
-      const lo         = parseFloat(q("trig-range-lo-seq").value);
-      const hi         = parseFloat(q("trig-range-hi-seq").value);
-      const hysteresis = parseFloat(q("trig-hysteresis-seq").value);
-      return {
-        prefixSteps:     [...editingPrefixSteps],
-        prefixWindowMs: parseInt(q("trig-prefix-window-ms-seq").value, 10) || 1500,
-        prefixDwellMs:  parseInt(q("trig-prefix-dwell-ms-seq").value, 10) || 100,
-        metric,
-        ...(!isNaN(lo) && !isNaN(hi) ? { range: [lo, hi] } : {}),
-        ...(!isNaN(hysteresis) ? { hysteresis } : {}),
-      };
-    },
+ fieldsHtml(trig) {
+       return `
+         <div class="field">
+           <label>Prefix steps — complete these to start the continuous gesture</label>
+           <div id="trig-prefix-steps-list"></div>
+           <div class="step-add-row">
+             <select id="trig-prefix-step-select">${poseOptions("")}</select>
+             <button class="btn-secondary" style="white-space:nowrap" onclick="addPrefixStep()">+ Add Step</button>
+           </div>
+         </div>
+         <div class="field-row">
+           <div class="field">
+             <label>Prefix window (ms) <span style="font-weight:400;color:var(--text-muted)">max time to complete sequence</span></label>
+             <input id="trig-prefix-window-ms-seq" type="number" min="100" step="100" value="${trig.prefixWindowMs ?? trig.prefix_window_ms ?? 1500}">
+           </div>
+           <div class="field">
+             <label>Prefix step dwell (ms)</label>
+             <input id="trig-prefix-dwell-ms-seq" type="number" min="0" step="10" value="${trig.prefixDwellMs ?? trig.prefix_dwell_ms ?? 100}">
+           </div>
+         </div>
+         <div class="field">
+           <label>Metric <span style="font-weight:400;color:var(--text-muted)">(continuous phase)</span></label>
+           <select id="trig-metric-seq">
+             ${METRICS.map(m => `<option value="${m}" ${m === trig.metric ? "selected" : ""}>${m}</option>`).join("")}
+           </select>
+         </div>
+         <div class="field">
+           <label>Range <span style="font-weight:400;color:var(--text-muted)">[min, max] raw sensor value</span></label>
+           <div class="range-row">
+             <input id="trig-range-lo-seq" type="number" step="0.01" placeholder="0.0" value="${trig.range?.[0] ?? ""}">
+             <span class="range-sep">→</span>
+             <input id="trig-range-hi-seq" type="number" step="0.01" placeholder="1.0" value="${trig.range?.[1] ?? ""}">
+           </div>
+         </div>
+         <div class="field" style="max-width:160px">
+           <label>Hysteresis <span style="font-weight:400;color:var(--text-muted)">slot deadzone</span></label>
+           <input id="trig-hysteresis-seq" type="number" step="0.01" min="0" max="0.5"
+                  placeholder="0.04" value="${trig.hysteresis ?? ""}">
+         </div>
+         <div class="field" style="max-width:160px">
+           <label>Grace period (ms) <span style="font-weight:400;color:var(--text-muted)">hold last pose/metric on tracking loss</span></label>
+           <input id="trig-grace-seq" type="number" min="0" step="10" value="${trig.gracePeriodMs ?? ""}">
+         </div>`;
+     },
+ readFields() {
+       if (editingPrefixSteps.length < 1) { alert("At least one prefix step is required."); return null; }
+       const modalBody = document.getElementById("modal-body");
+       const q = (id) => modalBody.querySelector(`#${id}`);
+       const metric     = q("trig-metric-seq").value;
+       const lo         = parseFloat(q("trig-range-lo-seq").value);
+       const hi         = parseFloat(q("trig-range-hi-seq").value);
+       const hysteresis = parseFloat(q("trig-hysteresis-seq").value);
+       const graceMs    = parseInt(q("trig-grace-seq").value, 10);
+       return {
+         prefixSteps:     [...editingPrefixSteps],
+         prefixWindowMs: parseInt(q("trig-prefix-window-ms-seq").value, 10) || 1500,
+         prefixDwellMs:  parseInt(q("trig-prefix-dwell-ms-seq").value, 10) || 100,
+         metric,
+         ...(!isNaN(lo) && !isNaN(hi) ? { range: [lo, hi] } : {}),
+         ...(!isNaN(hysteresis) ? { hysteresis } : {}),
+         ...(graceMs > 0 ? { gracePeriodMs: graceMs } : {}),
+       };
+     },
     meta(t) {
       const prefix = (t.prefix_steps || []).join(" → ");
       return `seq→cont  •  ${t.hand || "?"}  •  [${prefix}] → ${t.metric || "?"}`;
@@ -1043,7 +1159,7 @@ function editTrigger(i) {
   const trig       = binding.trigger ?? {};
   const descriptor = TRIGGER_TYPES.find(t => t.id === trig.type);
   editingSteps       = trig.type === "sequence"              ? [...(trig.steps        || [])] : [];
-  editingPrefixSteps = (trig.type === "sequencedContinuous" || trig.type === "sequenced_continuous") ? [...(trig.prefixSteps || trig.prefix_steps || [])] : [];
+  editingPrefixSteps = trig.type === "sequencedContinuous" ? [...(trig.prefixSteps || [])] : [];
   editingRequire     = [...(binding.require || [])];
   openModal(triggerModalHtml(binding), { type: "trigger", index: i });
   descriptor?.onShow?.();

@@ -37,6 +37,7 @@ import sys
 import time
 import threading
 import tomllib
+from collections import deque
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -130,6 +131,12 @@ class HandLandmarkerONNX:
         self._landOutConf = self._landmarkSess.get_outputs()[1].name
         self._landOutHand = self._landmarkSess.get_outputs()[2].name
         self._anchors = self._buildAnchors()
+        if "CUDAExecutionProvider" in self._palmSess.get_providers():
+            self._palmBinding     = self._palmSess.io_binding()
+            self._landmarkBinding = self._landmarkSess.io_binding()
+            self._useCudaBinding  = True
+        else:
+            self._useCudaBinding = False
 
     def _buildAnchors(self):
         anchors = []
@@ -165,10 +172,20 @@ class HandLandmarkerONNX:
 
     def _runPalmDetection(self, image):
         blob, ratio, padBias, origWH = self._preprocessPalm(image)
-        rawBox, rawScore = self._palmSess.run(
-            [self._palmOutBox, self._palmOutScore],
-            {self._palmInputName: blob}
-        )
+        if self._useCudaBinding:
+            b = self._palmBinding
+            b.bind_cpu_input(self._palmInputName, blob)
+            b.bind_output(self._palmOutBox,   "cuda")
+            b.bind_output(self._palmOutScore, "cuda")
+            self._palmSess.run_with_iobinding(b)
+            outs     = b.get_outputs()
+            rawBox   = outs[0].numpy()
+            rawScore = outs[1].numpy()
+        else:
+            rawBox, rawScore = self._palmSess.run(
+                [self._palmOutBox, self._palmOutScore],
+                {self._palmInputName: blob}
+            )
         # rawBox: [1,2016,18] — first 4 are cx,cy,w,h deltas; rest are landmark deltas
         # rawScore: [1,2016,1]
         boxDelta = rawBox[0, :, :4]       # (2016, 4)
@@ -256,10 +273,22 @@ class HandLandmarkerONNX:
 
     def _runLandmarkRegression(self, image, palm):
         blob, rotatedBbox, angle, rotMat, padBias = self._preprocessLandmark(image, palm)
-        lmRaw, confRaw, handRaw = self._landmarkSess.run(
-            [self._landOutLm, self._landOutConf, self._landOutHand],
-            {self._landmarkInputName: blob}
-        )
+        if self._useCudaBinding:
+            b = self._landmarkBinding
+            b.bind_cpu_input(self._landmarkInputName, blob)
+            b.bind_output(self._landOutLm,   "cuda")
+            b.bind_output(self._landOutConf, "cuda")
+            b.bind_output(self._landOutHand, "cuda")
+            self._landmarkSess.run_with_iobinding(b)
+            outs    = b.get_outputs()
+            lmRaw   = outs[0].numpy()
+            confRaw = outs[1].numpy()
+            handRaw = outs[2].numpy()
+        else:
+            lmRaw, confRaw, handRaw = self._landmarkSess.run(
+                [self._landOutLm, self._landOutConf, self._landOutHand],
+                {self._landmarkInputName: blob}
+            )
         conf = float(confRaw[0][0])
         if conf < self._LANDMARK_CONF_THRESHOLD:
             return None, None
@@ -346,8 +375,11 @@ class PoseTrigger:
     def buildState(self):
         return BindingState(debouncer=DwellDebouncer(self.dwellMs))
 
-    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress, gracePeriodMs=0):
         pose = None if suppress else getPoseForHand(handData, self.hand)
+        if pose is None and self.shape is not None:
+            if gracePeriodMs > 0 and timestampMs - bState.graceTimeMs < gracePeriodMs and bState.graceValue == self.shape:
+                pose = bState.graceValue
         if bState.debouncer.update(pose if pose == self.shape else None):
             publisher.gestureFired(name, self.hand)
 
@@ -367,7 +399,7 @@ class SwipeTrigger:
     def buildState(self):
         return BindingState()
 
-    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress, gracePeriodMs=0):
         if not suppress and getSwipeForHand(handData, self.hand) == self.direction:
             publisher.gestureFired(name, self.hand)
 
@@ -389,8 +421,10 @@ class SequenceTrigger:
         return BindingState(sequenceTracker=SequenceTracker(
             self.steps, self.windowMs, self.stepDwellMs))
 
-    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress, gracePeriodMs=0):
         pose = None if suppress else getPoseForHand(handData, self.hand)
+        if pose is None and gracePeriodMs > 0 and timestampMs - bState.graceTimeMs < gracePeriodMs:
+            pose = bState.graceValue
         stepsCompleted, done = bState.sequenceTracker.update(pose, timestampMs)
         if stepsCompleted:
             publisher.sequenceProgress(name, self.hand, stepsCompleted, len(self.steps))
@@ -408,22 +442,27 @@ class ContinuousTrigger:
     @classmethod
     def parse(cls, d, defaultDwellMs):
         return cls(hand=d.get("hand", "right"), metric=d["metric"],
-                   valueRange=parseRange(d["range"]) if "range" in d else (0.0, 1.0),
-                   hysteresis=float(d.get("hysteresis", 0.04)))
+                    valueRange=parseRange(d["range"]) if "range" in d else (0.0, 1.0),
+                    hysteresis=float(d.get("hysteresis", 0.04)))
 
     def buildState(self):
         return BindingState(continuousTracker=ContinuousTracker(self))
 
-    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress, gracePeriodMs=0):
         result = handData.get(self.hand) or _emptyResult()
         tracker = bState.continuousTracker
         wasActive = tracker.active
+        metrics = result.metrics
+        if not metrics and gracePeriodMs > 0 and timestampMs - bState.graceTimeMs < gracePeriodMs and bState.graceValue is not None:
+            metrics = {self.metric: bState.graceValue}
         value, ended = tracker.update(
-            result.metrics, timestampMs, enabled=condsMet and not suppress)
+            metrics, timestampMs, enabled=condsMet and not suppress)
         if not wasActive and tracker.active:
             publisher.continuousStart(name, self.hand)
             publisher.awaitSlotConfig(name, timeoutMs=50)
         if value is not None:
+            bState.graceValue = value
+            bState.graceTimeMs = timestampMs
             publisher.continuousUpdate(name, self.hand, publisher.applySlotConfig(name, tracker, value))
         if ended:
             publisher.continuousEnd(name, self.hand)
@@ -443,7 +482,7 @@ class ChordTrigger:
     def buildState(self):
         return BindingState(debouncer=DwellDebouncer(self.dwellMs))
 
-    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress, gracePeriodMs=0):
         leftResult  = handData.get("left")  or _emptyResult()
         rightResult = handData.get("right") or _emptyResult()
         chordHeld = leftResult.pose == self.left and rightResult.pose == self.right
@@ -486,9 +525,11 @@ class SequencedContinuousTrigger:
             continuousTracker=ContinuousTracker(self),
         )
 
-    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress):
+    def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress, gracePeriodMs=0):
         if not bState.prefixComplete:
             pose = None if suppress else getPoseForHand(handData, self.hand)
+            if pose is None and gracePeriodMs > 0 and timestampMs - bState.graceTimeMs < gracePeriodMs:
+                pose = bState.graceValue
             stepsCompleted, done = bState.sequenceTracker.update(pose, timestampMs)
             if stepsCompleted:
                 publisher.sequenceProgress(name, self.hand, stepsCompleted, len(self.prefixSteps))
@@ -508,12 +549,17 @@ class SequencedContinuousTrigger:
         result = handData.get(self.hand) or _emptyResult()
         tracker = bState.continuousTracker
         wasActive = tracker.active
+        metrics = result.metrics
+        if not metrics and gracePeriodMs > 0 and timestampMs - bState.graceTimeMs < gracePeriodMs and bState.graceValue is not None:
+            metrics = {self.metric: bState.graceValue}
         value, ended = tracker.update(
-            result.metrics, timestampMs, enabled=condsMet and not suppress)
+            metrics, timestampMs, enabled=condsMet and not suppress)
         if not wasActive and tracker.active:
             publisher.continuousStart(name, self.hand)
             publisher.awaitSlotConfig(name, timeoutMs=50)
         if value is not None:
+            bState.graceValue = value
+            bState.graceTimeMs = timestampMs
             publisher.continuousUpdate(name, self.hand, publisher.applySlotConfig(name, tracker, value))
         if ended:
             publisher.continuousEnd(name, self.hand)
@@ -600,6 +646,7 @@ def loadConfig(path):
         raw = tomllib.load(f)
     settings = raw.get("settings", {})
     defaultDwellMs = settings.get("dwellMs", settings.get("dwell_ms", 200))
+    gracePeriodMs = settings.get("gracePeriodMs", settings.get("grace_period_ms", 0))
     poses = [parsePose(p) for p in raw.get("poses", [])]
     bindings = [
         Binding(
@@ -708,14 +755,15 @@ class SwipeDetector:
         self.minDisplacement = minDisplacement
         self.windowMs = windowMs
         self.cooldownMs = cooldownMs
-        self.history = []  # [(timestamp_ms, x), ...]
+        self.history = deque()  # [(timestamp_ms, x), ...]
         self.lastFiredAt = 0
 
     def update(self, indexTipX, timestampMs):
         """Return 'LEFT_SWIPE', 'RIGHT_SWIPE', or None."""
         self.history.append((timestampMs, indexTipX))
         cutoff = timestampMs - self.windowMs
-        self.history = [(t, x) for t, x in self.history if t >= cutoff]
+        while self.history and self.history[0][0] < cutoff:
+            self.history.popleft()
 
         if timestampMs - self.lastFiredAt < self.cooldownMs:
             return None
@@ -744,12 +792,13 @@ class MotionFilter:
     def __init__(self, maxDisplacement=0.04, windowMs=150):
         self.maxDisplacement = maxDisplacement
         self.windowMs = windowMs
-        self.history = []  # [(timestamp_ms, x, y), ...]
+        self.history = deque()  # [(timestamp_ms, x, y), ...]
 
     def update(self, x, y, timestampMs):
         self.history.append((timestampMs, x, y))
         cutoff = timestampMs - self.windowMs
-        self.history = [(t, px, py) for t, px, py in self.history if t >= cutoff]
+        while self.history and self.history[0][0] < cutoff:
+            self.history.popleft()
 
     def isMoving(self):
         if len(self.history) < 2:
@@ -910,6 +959,20 @@ class BindingState:
     sequenceTracker: object = None
     continuousTracker: object = None
     prefixComplete: bool = False
+    gracePose: str = None
+    graceValue: float = None
+    graceTimeMs: float = 0.0
+
+    def getWithGrace(self, value, timestampMs, gracePeriodMs):
+        """Return value with grace period handling for None detection loss."""
+        if value is not None:
+            self.gracePose = value
+            self.graceValue = value
+            self.graceTimeMs = timestampMs
+            return value
+        if gracePeriodMs > 0 and timestampMs - self.graceTimeMs < gracePeriodMs:
+            return self.graceValue
+        return None
 
 
 def buildBindingState(binding, defaultDwellMs):
@@ -946,8 +1009,9 @@ class TriggerMatcher:
     """Matches per-frame hand data against all configured bindings
     and calls the publisher when triggers fire."""
 
-    def __init__(self, bindings, publisher, defaultDwellMs):
+    def __init__(self, bindings, publisher, defaultDwellMs, gracePeriodMs=0):
         self.publisher = publisher
+        self.gracePeriodMs = gracePeriodMs
         self.states = [buildBindingState(b, defaultDwellMs) for b in bindings]
 
     def update(self, handData, timestampMs):
@@ -995,7 +1059,7 @@ class TriggerMatcher:
             return
 
         b.trigger.process(bState, handData, timestampMs, self.publisher, b.name,
-                          conditionsMet, suppress)
+                          conditionsMet, suppress, self.gracePeriodMs)
 
 
 # ── D-Bus publisher ────────────────────────────────────────────────────────────
@@ -1278,45 +1342,31 @@ def calibrateMetric(metric, camInput, hand="either", countdown=3, sampleSecs=2):
 
 
 class _PoseDetectResult:
-    __slots__ = ("pose_landmarks",)
+    __slots__ = ("poseLandmarks",)
     def __init__(self, poseLandmarks):
-        self.pose_landmarks = poseLandmarks
+        self.poseLandmarks = poseLandmarks
 
 
 class PoseLandmarkerONNX:
-    _CONF_THRESHOLD = 0.5
-
-    def __init__(self, modelPath):
-        self._session = _createOnnxSession(modelPath)
-
-        inputShape = self._session.get_inputs()[0].shape  # [1, 3, H, W]
-        self._inputH = inputShape[2]
-        self._inputW = inputShape[3]
-
-        outputInfo = ", ".join(
-            f"{o.name}{o.shape}" for o in self._session.get_outputs()
+    def __init__(self, modelPath, minConfidence=0.2):
+        self._minConfidence = minConfidence
+        self._landmarker = PoseLandmarker.create_from_options(
+            PoseLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(modelPath)),
+                running_mode=VisionRunningMode.VIDEO,
+                num_poses=1,
+                min_pose_detection_confidence=minConfidence,
+                min_pose_presence_confidence=minConfidence,
+            )
         )
-        print(f"[presence] ONNX outputs: {outputInfo}", file=sys.stderr)
-
-        self._confOutputName = None
-        for out in self._session.get_outputs():
-            if len(out.shape) == 3 and out.shape[2] == 1:
-                self._confOutputName = out.name
-                break
-        if self._confOutputName is None:
-            self._confOutputName = self._session.get_outputs()[0].name
+        print(f"[presence] PoseLandmarker loaded from {modelPath.name} (minConf={minConfidence})", file=sys.stderr)
 
     def detect_for_video(self, frameBgr, timestampMs):
-        resized = cv2.resize(frameBgr, (self._inputW, self._inputH))
-        if len(resized.shape) == 2:
-            resized = cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
-        frameRgb = resized[:, :, ::-1].astype(np.float32) / 255.0
-        inputTensor = np.transpose(frameRgb, (2, 0, 1))[np.newaxis, ...]  # [1,3,H,W]
-
-        outputs = self._session.run([self._confOutputName], {"input_1:0": inputTensor})
-        scores = outputs[0][0, :, 0]  # shape [N]
-        personPresent = bool(np.any(scores > self._CONF_THRESHOLD))
-        return _PoseDetectResult([True] if personPresent else [])
+        frameRgb = cv2.cvtColor(frameBgr, cv2.COLOR_BGR2RGB)
+        mpImg = mp.Image(image_format=mp.ImageFormat.SRGB, data=frameRgb)
+        result = self._landmarker.detect_for_video(mpImg, timestampMs)
+        landmarks = result.pose_landmarks if result.pose_landmarks else []
+        return _PoseDetectResult(landmarks)
 
 
 def buildHandLandmarker():
@@ -1335,18 +1385,11 @@ def buildHandLandmarker():
 
 
 def buildPoseLandmarker(minConfidence=0.5):
-    if not PERSON_DETECT_MODEL_PATH.exists():
-        print(f"[presence] person detection model not found at {PERSON_DETECT_MODEL_PATH}", file=sys.stderr)
+    taskModelPath = Path.home() / ".local/share/gesturecontrol/pose_landmarker_lite.task"
+    if not taskModelPath.exists():
+        print(f"[presence] pose model not found at {taskModelPath}", file=sys.stderr)
         return None
-    pm = PoseLandmarkerONNX(PERSON_DETECT_MODEL_PATH)
-    if "CUDAExecutionProvider" not in pm._session.get_providers():
-        global _onnxCudaNotified
-        if not _onnxCudaNotified:
-            _onnxCudaNotified = True
-            notifyError(
-                "gestureControl",
-                "Pose detection running on CPU — GPU (CUDA) not available. Performance may be reduced.",
-            )
+    pm = PoseLandmarkerONNX(taskModelPath, minConfidence)
     return pm
 
 
@@ -1374,10 +1417,10 @@ def openCamera(camInput, width=None, height=None, fmt=None):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     if height:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"[init] camera {actual_w}x{actual_h} @ {actual_fps:.0f} fps (native)")
+    actualW = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actualH = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actualFps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"[init] camera {actualW}x{actualH} @ {actualFps:.0f} fps (native)")
     return cap
 
 
@@ -1452,6 +1495,7 @@ class StreamServer:
         self._lock  = threading.Lock()
         self._frame = None
         self._hands = {}
+        self._presence = {}
         server = ThreadingHTTPServer(("127.0.0.1", port), self._makeHandler())
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
@@ -1461,6 +1505,10 @@ class StreamServer:
         with self._lock:
             self._frame = jpegBytes
             self._hands = hands
+
+    def setPresence(self, p):
+        with self._lock:
+            self._presence = p
 
     def _makeHandler(self):
         server = self
@@ -1524,7 +1572,10 @@ class StreamServer:
                 try:
                     while True:
                         with server._lock:
-                            data = {"hands": dict(server._hands)}
+                            data = {
+                                "hands": dict(server._hands),
+                                "presence": dict(server._presence),
+                            }
                         self.wfile.write(
                             f"data: {json.dumps(data)}\n\n".encode()
                         )
@@ -1569,6 +1620,7 @@ def main():
 
     settings, poses, bindings, presence = loadConfig(args.config)
     defaultDwellMs = settings.get("dwellMs", settings.get("dwell_ms", 200))
+    gracePeriodMs = settings.get("gracePeriodMs", settings.get("grace_period_ms", 0))
     spreadThreshold = settings.get("spreadThreshold", settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD))
     print(f"Loaded {len(poses)} pose(s), {len(bindings)} binding(s) from {args.config}")
     configWatcher = ConfigWatcher(args.config)
@@ -1580,7 +1632,7 @@ def main():
         "right": HandProcessor(poses, spreadThreshold),
         "left":  HandProcessor(poses, spreadThreshold),
     }
-    matcher = TriggerMatcher(bindings, publisher, defaultDwellMs)
+    matcher = TriggerMatcher(bindings, publisher, defaultDwellMs, gracePeriodMs)
     darkFrameDetector = DarkFrameDetector()
 
     camInput = args.input if args.input is not None else settings.get("camera", 0)
@@ -1619,6 +1671,7 @@ def main():
         presencePoseMinConf = presence.get("poseMinConfidence", 0.5)
         presencePoseCheckMode = presence.get("poseCheckMode", "fallback")
         presencePauseHands = presence.get("pauseHandsWhenAbsent", True)
+        useMotionDetection = presence.get("useMotionDetection", True)
         presenceRef = None
         presenceLastCheck = 0.0
         presenceLastActive = time.monotonic()
@@ -1632,12 +1685,13 @@ def main():
                     prevSettings = settings
                     settings, poses, bindings, presence = loadConfig(args.config)
                     defaultDwellMs = settings.get("dwellMs", settings.get("dwell_ms", 200))
+                    gracePeriodMs = settings.get("gracePeriodMs", settings.get("grace_period_ms", 0))
                     spreadThreshold = settings.get("spreadThreshold", settings.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD))
                     processors = {
                         "right": HandProcessor(poses, spreadThreshold),
                         "left":  HandProcessor(poses, spreadThreshold),
                     }
-                    matcher = TriggerMatcher(bindings, publisher, defaultDwellMs)
+                    matcher = TriggerMatcher(bindings, publisher, defaultDwellMs, gracePeriodMs)
                     inferenceFps = settings.get("fps") or 0
                     inferenceInterval = (1.0 / inferenceFps) if inferenceFps > 0 else 0
                     presenceEnabled = presence.get("enabled", False)
@@ -1649,6 +1703,9 @@ def main():
                     newPoseMinConf = presence.get("poseMinConfidence", 0.5)
                     presencePoseCheckMode = presence.get("poseCheckMode", "fallback")
                     presencePauseHands = presence.get("pauseHandsWhenAbsent", True)
+                    newUseMotionDetection = presence.get("useMotionDetection", True)
+                    if newUseMotionDetection != useMotionDetection:
+                        useMotionDetection = newUseMotionDetection
                     if newPoseDetection != presencePoseDetection or newPoseMinConf != presencePoseMinConf:
                         if poseLandmarker is not None:
                             poseLandmarker = None
@@ -1698,23 +1755,30 @@ def main():
             now = time.monotonic()
             if presenceEnabled and (now - presenceLastCheck) >= presenceInterval:
                 presenceLastCheck = now
-                small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                                   if len(frame.shape) == 3 else frame,
-                                   (64, 64)).astype(float)
-                if presenceRef is None:
-                    presenceRef = small
-                diff = float(abs(small - presenceRef).mean())
-                # slow drift tracker so lighting changes don't trigger motion
-                presenceRef = 0.95 * presenceRef + 0.05 * small
-                motionDetected = diff > presenceThreshold
+                motionDetected = False
+                poseDetected = False
+
+                if useMotionDetection:
+                    small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                                       if len(frame.shape) == 3 else frame,
+                                       (64, 64)).astype(float)
+                    if presenceRef is None:
+                        presenceRef = small
+                    diff = float(abs(small - presenceRef).mean())
+                    # slow drift tracker so lighting changes don't trigger motion
+                    presenceRef = 0.95 * presenceRef + 0.05 * small
+                    motionDetected = diff > presenceThreshold
 
                 if poseLandmarker is not None and (
-                    presencePoseCheckMode == "always" or not motionDetected
+                    useMotionDetection and (presencePoseCheckMode == "always" or not motionDetected)
+                    or not useMotionDetection
                 ):
                     timestampMs = int(now * 1000)
                     poseResult = poseLandmarker.detect_for_video(frame, timestampMs)
-                    if poseResult.pose_landmarks:
-                        motionDetected = True
+                    if poseResult and poseResult.poseLandmarks:
+                        poseDetected = True
+
+                motionDetected = motionDetected or poseDetected
 
                 if motionDetected:
                     presenceLastActive = now
@@ -1730,6 +1794,19 @@ def main():
                     if presencePauseHands and landmarker is not None:
                         print("[presence] screen off — releasing hand landmarker")
                         landmarker = None
+
+            if streamServer is not None and presenceEnabled:
+                streamServer.setPresence({
+                    "enabled": presenceEnabled,
+                    "motionDetected": motionDetected if presenceEnabled else False,
+                    "poseDetected": poseDetected if presenceEnabled else False,
+                    "useMotionDetection": useMotionDetection,
+                    "screenBlanked": presenceBlanked,
+                    "timeSinceLastActive": int((now - presenceLastActive) * 1000),
+                    "idleSeconds": presenceIdleSecs,
+                    "poseDetection": presencePoseDetection,
+                    "checkHz": presenceCheckHz,
+                })
 
             if inferenceInterval == 0 or (now - lastInferenceTime) >= inferenceInterval:
                 if landmarker is not None:
