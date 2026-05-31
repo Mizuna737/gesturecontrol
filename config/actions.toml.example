@@ -1,8 +1,25 @@
+# Example action bindings for gestureControl.
+# Each binding maps a gesture signal name to an action.
+# Actions support an optional `context` field for window-scoped execution.
+
+# Execute a command directly (no shell)
 [[bindings]]
 signal = "play_pause"
-action = { cmd = ["playerctl", "play-pause"], type = "exec" }
+action = { type = "exec", cmd = ["playerctl", "play-pause"] }
 
+# Key press via xdotool (requires xdotool package)
 [[bindings]]
 signal = "browser_back"
 context = "qutebrowser"
 action = { type = "key", key = "shift+h" }
+
+# Shell command with {value} template — useful for continuous triggers
+# [[bindings]]
+# signal = "set_volume"
+# action = { type = "execScaled", template = "pactl set-sink-volume @DEFAULT_SINK@ {value}" }
+
+# Continuous triggers can have an onEnd handler that fires when the trigger ends
+# [[bindings]]
+# signal = "set_volume"
+# action = { type = "exec", cmd = ["playerctl", "set-volume", "{value}"] }
+# onEnd = { type = "exec", cmd = ["notify-send", "Volume control ended"] }
