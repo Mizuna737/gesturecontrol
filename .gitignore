@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 *.pyo
+.claude/
+
+# Personal config lives in dotfiles → ~/.config/gesturecontrol/
+triggers.toml
+actions.toml
