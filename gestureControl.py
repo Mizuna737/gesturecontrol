@@ -309,10 +309,8 @@ class HandLandmarkerONNX:
     def detect_for_video(self, frameOrMpImage, timestampMs):
         if hasattr(frameOrMpImage, 'numpy_view'):
             frame = frameOrMpImage.numpy_view()  # mp.Image → numpy (RGB)
-            # convert back to BGR for consistent processing
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         else:
-            frame = frameOrMpImage  # already numpy BGR
+            frame = cv2.cvtColor(frameOrMpImage, cv2.COLOR_BGR2RGB)
         h, w = frame.shape[:2]
         palms = self._runPalmDetection(frame)
         handLandmarksList = []
