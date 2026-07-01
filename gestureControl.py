@@ -447,7 +447,10 @@ class ContinuousTrigger:
         return BindingState(continuousTracker=ContinuousTracker(self))
 
     def process(self, bState, handData, timestampMs, publisher, name, condsMet, suppress, gracePeriodMs=0):
-        result = handData.get(self.hand) or _emptyResult()
+        if self.hand == "either":
+            result = handData.get("right") or handData.get("left") or _emptyResult()
+        else:
+            result = handData.get(self.hand) or _emptyResult()
         tracker = bState.continuousTracker
         wasActive = tracker.active
         metrics = result.metrics
@@ -544,7 +547,10 @@ class SequencedContinuousTrigger:
             bState.sequenceTracker.reset()
             return
 
-        result = handData.get(self.hand) or _emptyResult()
+        if self.hand == "either":
+            result = handData.get("right") or handData.get("left") or _emptyResult()
+        else:
+            result = handData.get(self.hand) or _emptyResult()
         tracker = bState.continuousTracker
         wasActive = tracker.active
         metrics = result.metrics
